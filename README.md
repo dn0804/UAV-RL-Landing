@@ -14,19 +14,16 @@ cd UAV-RL-Landing
 ### 2. Build and Start the Container
 On Linux:
 ```
-# Grants local Docker GUI permissions and launches the container
 sudo bash scripts/build_container.sh
 ```
 
 On Windows (PowerShell Admin):
 ```
-# Verifies X-Server is running and launches the container
 .\scripts\start_uav.ps1
 ```
 
 ### 3. Enter the Workspace
 Once the container is running in the background, open a terminal inside it:
-Bash
 ```
 docker exec -it uav_rl_container bash
 ```
