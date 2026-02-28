@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  uav_dev:
+    build: .
+    container_name: uav_rl_container
+    stdin_open: true 
+    tty: true        
+    privileged: true
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - LIBGL_ALWAYS_INDIRECT=0
+    volumes:
+      - ./:/workspace
+      # Linux GUI Forwarding
+      # - /tmp/.X11-unix:/tmp/.X11-unix:rw
+
+    # ---------------------------------------------------------
+    # NVIDIA GPU PASSTHROUGH (Linux + NVIDIA Host Only)
+    # Uncomment the section below if running on an Ubuntu desktop with an NVIDIA GPU.
+    # ---------------------------------------------------------
+    # environment:
+    #   - DISPLAY=${DISPLAY}
+    #   - QT_X11_NO_MITSHM=1
+    #   - NVIDIA_VISIBLE_DEVICES=all
+    #   - NVIDIA_DRIVER_CAPABILITIES=all
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    command: /bin/bash
