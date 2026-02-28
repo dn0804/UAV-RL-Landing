@@ -6,7 +6,6 @@ This project runs inside a containerized Ubuntu 22.04 environment with ROS 2 Hum
 * Git
 
 ### 1. Clone the Repository
-Bash
 ```
 git clone https://github.com/bstahman/UAV-RL-Landing.git
 cd UAV-RL-Landing
@@ -14,14 +13,12 @@ cd UAV-RL-Landing
 
 ### 2. Build and Start the Container
 On Linux:
-Bash
 ```
 # Grants local Docker GUI permissions and launches the container
 sudo bash scripts/build_container.sh
 ```
 
 On Windows (PowerShell Admin):
-PowerShell
 ```
 # Verifies X-Server is running and launches the container
 .\scripts\start_uav.ps1
