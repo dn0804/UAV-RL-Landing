@@ -6,31 +6,25 @@ This project runs inside a containerized Ubuntu 22.04 environment with ROS 2 Hum
 * Git
 
 ### 1. Clone the Repository
-Bash
-```bash
+```
 git clone https://github.com/bstahman/UAV-RL-Landing.git
 cd UAV-RL-Landing
 ```
 
 ### 2. Build and Start the Container
 On Linux:
-Bash
-```bash
-# Grants local Docker GUI permissions and launches the container
+```
 sudo bash scripts/build_container.sh
 ```
 
 On Windows (PowerShell Admin):
-PowerShell
-```powershell
-# Verifies X-Server is running and launches the container
+```
 .\scripts\start_uav.ps1
 ```
 
 ### 3. Enter the Workspace
 Once the container is running in the background, open a terminal inside it:
-Bash
-```bash
+```
 docker exec -it uav_rl_container bash
 ```
 
@@ -39,7 +33,7 @@ Note: Your local repository folder is mounted to `/workspace` inside the contain
 ### 4. Verify the Simulation Stack
 To confirm the flight controller and 3D physics engine are working, run the following inside the container:
 Bash
-```bash
+```
 cd /PX4-Autopilot
 make px4_sitl gz_x500
 ```
