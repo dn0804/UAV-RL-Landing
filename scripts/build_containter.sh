@@ -18,7 +18,6 @@ if lspci | grep -i nvidia &> /dev/null; then
 
     # 3. Create Docker Compose Override for GPU
     cat <<EOF > docker-compose.override.yml
-version: '3.8'
 services:
   uav_dev:
     environment:

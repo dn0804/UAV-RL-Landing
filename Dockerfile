@@ -51,4 +51,18 @@ RUN git clone https://github.com/eProsima/Micro-XRCE-DDS-Agent.git /Micro-XRCE-D
 RUN apt-get update && apt-get install -y python3-colcon-common-extensions \
     && rm -rf /var/lib/apt/lists/*
 
+# 1. Pull the compiled uv binary directly from Astral's official image
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# 2. Copy your requirements file into the container
+COPY requirements.txt /tmp/requirements.txt
+
+# 3. Create a virtual environment that allows ROS 2 imports
+RUN uv venv /opt/venv --system-site-packages
+
+# 4. Make the virtual environment the default Python path for all future commands
+ENV PATH="/opt/venv/bin:$PATH"
+
+RUN uv pip install -r /tmp/requirements.txt
+
 WORKDIR /workspace

@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   uav_dev:
     build: .
@@ -11,6 +9,8 @@ services:
       - DISPLAY=${DISPLAY}
       - QT_X11_NO_MITSHM=1
       - LIBGL_ALWAYS_INDIRECT=0
+    ports:
+      - "6006:6006" 
     volumes:
       - ./:/workspace
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
