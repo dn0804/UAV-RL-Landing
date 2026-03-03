@@ -1,9 +1,8 @@
 ## Installation & Setup
-This project runs inside a containerized Ubuntu 22.04 environment with ROS 2 Humble, Gazebo Garden, and PX4 SITL (v1.14). All dependencies are bundled in the Docker image to ensure consistency across operating systems.
+This project runs inside a containerized Ubuntu 22.04 environment with ROS 2 Humble, Gazebo Garden, and PX4 SITL (v1.14). All dependencies are bundled in the Docker image.
 
 ### Prerequisites
-* Docker and Docker Compose
-* Git
+* Docker and Git
 
 ### 1. Clone the Repository
 ```
