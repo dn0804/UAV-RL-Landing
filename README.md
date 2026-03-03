@@ -30,12 +30,8 @@ docker exec -it uav_rl_container bash
 
 Note: Your local repository folder is mounted to `/workspace` inside the container. Any code you edit on your host machine will instantly update inside the container.
 
-### 4. Verify the Simulation Stack
-To confirm the flight controller and 3D physics engine are working, run the following inside the container:
-Bash
+### 4. Run the Simulation Stack
+To run the stack, run the startup script `run.sh` from within the docker container:
 ```
-cd /PX4-Autopilot
-make px4_sitl gz_x500
+bash scripts/run.sh
 ```
-
-If successful, Gazebo will open displaying an x500 quadrotor, and your terminal will show the `pxh>` flight controller prompt. Type `commander takeoff` in the terminal to execute a test flight.
