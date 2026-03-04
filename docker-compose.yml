@@ -2,6 +2,7 @@ services:
   uav_dev:
     build: .
     container_name: uav_rl_container
+    network_mode: "host"
     stdin_open: true 
     tty: true        
     privileged: true
@@ -9,8 +10,6 @@ services:
       - DISPLAY=${DISPLAY}
       - QT_X11_NO_MITSHM=1
       - LIBGL_ALWAYS_INDIRECT=0
-    ports:
-      - "6006:6006" 
     volumes:
       - ./:/workspace
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
