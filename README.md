@@ -1,11 +1,9 @@
-```markdown
 ## Installation & Setup
 This project runs inside a containerized Ubuntu 22.04 environment with ROS 2 Humble, Gazebo Garden, and a simulated DJI Tello stack via `ros_gz_bridge`. All dependencies are bundled in the Docker image to ensure consistency across operating systems and hardware.
 
 ### Prerequisites
 * Docker and Docker Compose
 * Git
-* (Optional but Recommended) NVIDIA Container Toolkit for GPU acceleration
 
 ### 1. Clone the Repository
 ```bash
