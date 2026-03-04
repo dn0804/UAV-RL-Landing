@@ -57,4 +57,3 @@ To launch Gazebo, spawn the Tello drone, and start the Reinforcement Learning tr
 ```bash
 bash scripts/run.sh
 ```
-```
