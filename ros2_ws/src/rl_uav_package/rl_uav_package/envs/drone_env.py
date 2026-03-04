@@ -1,3 +1,4 @@
+import subprocess
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
@@ -8,55 +9,53 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 import math
 import time
 
-# PX4 Messages
-from px4_msgs.msg import TrajectorySetpoint
-from px4_msgs.msg import VehicleOdometry
-from px4_msgs.msg import OffboardControlMode
-from px4_msgs.msg import VehicleCommand
+# Standard ROS 2 Messages (Replaces PX4)
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from std_msgs.msg import Empty
 
 class DroneEnv(gym.Env):
     """
-    Gymnasium environment wrapper for PX4 SITL via ROS 2.
+    Gymnasium environment wrapper for Tello ROS 2 (Sim and Real).
     """
     def __init__(self):
         super(DroneEnv, self).__init__()
         
-        # 1. Initialize ROS 2 in the main thread
+        # 1. Initialize ROS 2
         if not rclpy.ok():
             rclpy.init()
             
-        self.node = rclpy.create_node('rl_drone_env_node')
-        print("[DEBUG] ROS 2 Node 'rl_drone_env_node' initialized.")
+        self.node = rclpy.create_node('rl_tello_env_node')
         
-        # 2. Define Spaces (Phase 1: Ground Truth)
-        # Action: [vx, vy, vz, yaw_rate] in BODY FRAME (m/s and rad/s)
-        self.action_space = spaces.Box(low=-2.0, high=2.0, shape=(4,), dtype=np.float32)
+        # 2. Define Spaces
+        # Action: [vx (fwd), vy (left), vz (up), yaw_rate]
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
         
-        # Observation: [x, y, z, vx, vy, vz, roll, pitch, yaw, pad_rel_fwd, pad_rel_right, pad_rel_down]
+        # Observation: [x, y, z, vx, vy, vz, roll, pitch, yaw, pad_rel_fwd, pad_rel_left, pad_rel_up]
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(12,), dtype=np.float32)
         
         # 3. ROS 2 Publishers & Subscribers
-        # PX4 heavily relies on BEST_EFFORT QoS. Applying this to publishers as well.
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
         
+        # Standard Tello topics
         self.odom_sub = self.node.create_subscription(
-            VehicleOdometry, '/fmu/out/vehicle_odometry', self._odom_callback, qos_profile)
+            Odometry, '/odom', self._odom_callback, qos_profile)
             
-        self.trajectory_pub = self.node.create_publisher(
-            TrajectorySetpoint, '/fmu/in/trajectory_setpoint', qos_profile)
+        self.cmd_vel_pub = self.node.create_publisher(
+            Twist, '/cmd_vel', 10)
             
-        self.offboard_mode_pub = self.node.create_publisher(
-            OffboardControlMode, '/fmu/in/offboard_control_mode', qos_profile)
+        self.takeoff_pub = self.node.create_publisher(
+            Empty, '/takeoff', 10)
             
-        self.vehicle_command_pub = self.node.create_publisher(
-            VehicleCommand, '/fmu/in/vehicle_command', qos_profile)
+        self.land_pub = self.node.create_publisher(
+            Empty, '/land', 10)
 
-        # 4. Synchronization & Tracking Variables
+        # 4. Synchronization Variables
         self.state_event = threading.Event()
         self.latest_odom = None
         self.current_action = np.zeros(4, dtype=np.float32)
@@ -64,94 +63,50 @@ class DroneEnv(gym.Env):
         
         self.max_steps = 300  # 30 seconds at 10Hz
         self.current_step = 0
-        self.odom_receive_count = 0
         
-        # 5. Start ROS 2 Spin in a Background Thread
+        # 5. Start ROS 2 Spin Thread
         self.executor_thread = threading.Thread(target=self._spin_ros, daemon=True)
         self.executor_thread.start()
-
-        # 6. PX4 Offboard Heartbeat Timer
-        self.heartbeat_timer = self.node.create_timer(0.1, self._publish_heartbeat)
-        print("[DEBUG] Environment setup complete. Waiting for first reset().")
+        
+        self.node.get_logger().info("Tello Environment initialized.")
 
     def _spin_ros(self):
-        """Continuously processes ROS 2 callbacks in the background."""
         rclpy.spin(self.node)
 
     def _odom_callback(self, msg):
-        """Triggered asynchronously whenever PX4 publishes new odometry."""
         self.latest_odom = msg
-        self.odom_receive_count += 1
         self.state_event.set()
 
-    def _publish_heartbeat(self):
-        """Published at 10Hz to keep PX4 in Offboard mode."""
-        offboard_msg = OffboardControlMode()
-        offboard_msg.position = False
-        offboard_msg.velocity = True
-        offboard_msg.acceleration = False
-        offboard_msg.attitude = False
-        offboard_msg.body_rate = False
-        offboard_msg.timestamp = int(self.node.get_clock().now().nanoseconds / 1000)
-        self.offboard_mode_pub.publish(offboard_msg)
-        
-        self._publish_action(self.current_action)
-
-    def _send_vehicle_command(self, command, param1=0.0, param2=0.0):
-        """Sends MAVLink commands directly to PX4."""
-        print(f"[DEBUG] Sending VehicleCommand: {command} (p1:{param1}, p2:{param2})")
-        msg = VehicleCommand()
-        msg.command = command
-        msg.param1 = float(param1)
-        msg.param2 = float(param2)
-        msg.target_system = 1
-        msg.target_component = 1
-        msg.source_system = 1
-        msg.source_component = 1
-        msg.from_external = True
-        msg.timestamp = int(self.node.get_clock().now().nanoseconds / 1000)
-        self.vehicle_command_pub.publish(msg)
-
     def _get_euler_from_quaternion(self, q):
-        """Converts FRD quaternion [w, x, y, z] to roll, pitch, yaw in radians."""
-        sinr_cosp = 2.0 * (q[0] * q[1] + q[2] * q[3])
-        cosr_cosp = 1.0 - 2.0 * (q[1] * q[1] + q[2] * q[2])
+        """Converts standard ROS 2 quaternion (x, y, z, w) to roll, pitch, yaw."""
+        # Note: ROS 2 places 'w' at the end, unlike PX4.
+        sinr_cosp = 2.0 * (q.w * q.x + q.y * q.z)
+        cosr_cosp = 1.0 - 2.0 * (q.x * q.x + q.y * q.y)
         roll = math.atan2(sinr_cosp, cosr_cosp)
 
-        sinp = 2.0 * (q[0] * q[2] - q[3] * q[1])
+        sinp = 2.0 * (q.w * q.y - q.z * q.x)
         if abs(sinp) >= 1:
             pitch = math.copysign(math.pi / 2, sinp)
         else:
             pitch = math.asin(sinp)
 
-        siny_cosp = 2.0 * (q[0] * q[3] + q[1] * q[2])
-        cosy_cosp = 1.0 - 2.0 * (q[2] * q[2] + q[3] * q[3])
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         yaw = math.atan2(siny_cosp, cosy_cosp)
 
         return roll, pitch, yaw
 
     def _publish_action(self, action):
-        """Translates the RL agent's body-frame action to PX4's NED frame message."""
-        if self.latest_odom is None:
-            return
-            
-        vx_body, vy_body, vz_body, yaw_rate = action
-        _, _, yaw = self._get_euler_from_quaternion(self.latest_odom.q)
+        """Publish Body-Frame velocities directly to /cmd_vel."""
+        msg = Twist()
+        msg.linear.x = float(action[0])  # Forward
+        msg.linear.y = float(action[1])  # Left
+        msg.linear.z = float(action[2])  # Up
+        msg.angular.z = float(action[3]) # Yaw
         
-        v_north = vx_body * math.cos(yaw) - vy_body * math.sin(yaw)
-        v_east  = vx_body * math.sin(yaw) + vy_body * math.cos(yaw)
-        
-        msg = TrajectorySetpoint()
-        msg.velocity[0] = float(v_north)
-        msg.velocity[1] = float(v_east)
-        msg.velocity[2] = float(vz_body)
-        msg.yawspeed = float(yaw_rate)
-        msg.timestamp = int(self.node.get_clock().now().nanoseconds / 1000)
-        
-        self.trajectory_pub.publish(msg)
+        self.cmd_vel_pub.publish(msg)
 
     def step(self, action):
-        """Synchronous step function expected by Stable-Baselines3."""
         self.previous_action = np.copy(self.current_action)
         self.current_action = action
         self.current_step += 1
@@ -159,9 +114,8 @@ class DroneEnv(gym.Env):
         self.state_event.clear()
         self._publish_action(action)
         
-        msg_received = self.state_event.wait(timeout=0.5) 
-        if not msg_received:
-            print("[DEBUG] WARNING: Timeout waiting for odometry data in step()!")
+        # Wait for physics update
+        self.state_event.wait(timeout=0.5) 
         
         obs = self._get_obs()
         reward, terminated = self._compute_reward_and_termination()
@@ -170,121 +124,127 @@ class DroneEnv(gym.Env):
         if self.current_step >= self.max_steps and not terminated:
             truncated = True
             
-        # Periodically log flight status to prove it is or isn't moving
-        if self.current_step % 50 == 0:
-            z_alt = self.latest_odom.position[2] if self.latest_odom else 0.0
-            print(f"[DEBUG] Step {self.current_step:03d} | Z-Alt (NED): {z_alt:.3f} | Odom Msgs Received: {self.odom_receive_count}")
-            
-        info = {}
-        return obs, reward, terminated, truncated, info
+        return obs, reward, terminated, truncated, {}
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        print("\n[DEBUG] --- RESET CALLED ---")
         self.current_step = 0
+        self.current_action = np.zeros(4, dtype=np.float32)
+        self.previous_action = np.zeros(4, dtype=np.float32)
         
-        # 1. Command an aggressive upward velocity (-2.0 m/s Z)
-        self.current_action = np.array([0.0, 0.0, -2.0, 0.0], dtype=np.float32)
-        self.previous_action = np.copy(self.current_action)
+        self.node.get_logger().info("--- RESETTING EPISODE (TELEPORTING) ---")
         
-        # 2. Warmup Delay
-        print(f"[DEBUG] Warming up DDS connection for 1.5s. Odoms received so far: {self.odom_receive_count}")
-        time.sleep(1.5) 
+        # 1. Kill all current velocities
+        self._publish_action([0.0, 0.0, 0.0, 0.0])
         
-        # 3. Arm and Offboard
-        print("[DEBUG] Firing ARM command (400)...")
-        self._send_vehicle_command(400, param1=1.0)
+        # 2. TELEPORT: Use Gazebo's command-line service to instantly move the drone
+        # We spawn it 1.0 meters in the air so the RL agent starts in a hover state.
+        subprocess.run([
+            'gz', 'service', '-s', '/world/tello_sim/set_pose',
+            '--reqtype', 'gz.msgs.Pose',
+            '--reptype', 'gz.msgs.Boolean',
+            '--timeout', '2000',
+            '--req', 'name: "tello", position: {x: 0.0, y: 0.0, z: 1.0}, orientation: {w: 1.0, x: 0.0, y: 0.0, z: 0.0}'
+        ], capture_output=True)
+        
+        # 3. Publish Standard ROS 2 Takeoff Command (For the REAL Tello later)
+        self.takeoff_pub.publish(Empty())
+        
+        # 4. Wait a brief moment for the physics engine to register the teleport
         time.sleep(0.5) 
         
-        print("[DEBUG] Firing OFFBOARD command (176)...")
-        self._send_vehicle_command(176, param1=1.0, param2=6.0)
-        
-        # --- 4. NEW: AUTOMATED TAKEOFF PHASE ---
-        print("[DEBUG] Executing automated takeoff to start altitude...")
-        # The background heartbeat is currently publishing our [0, 0, -2.0, 0] action.
-        # We just wait here for 3 seconds while PX4 physically flies the drone upward.
-        for _ in range(30): 
-            time.sleep(0.1)
-            
-        print("[DEBUG] Takeoff complete. Handing control to RL Agent.")
-        
-        # 5. Clear event flag and wait for next physics tick
         self.state_event.clear()
         self.state_event.wait(timeout=1.0)
         
-        info = {}
-        return self._get_obs(), info
+        return self._get_obs(), {}
 
     def _get_obs(self):
-        """Extracts numerical state vector and transforms target to Body Frame."""
+        """Extracts numerical state and calculates target relative to drone nose."""
         if self.latest_odom is None:
             return np.zeros(12, dtype=np.float32)
 
-        x, y, z = self.latest_odom.position
-        vx, vy, vz = self.latest_odom.velocity
-        roll, pitch, yaw = self._get_euler_from_quaternion(self.latest_odom.q)
+        # Extract position and velocity from nav_msgs/Odometry
+        x = self.latest_odom.pose.pose.position.x
+        y = self.latest_odom.pose.pose.position.y
+        z = self.latest_odom.pose.pose.position.z
+        
+        vx = self.latest_odom.twist.twist.linear.x
+        vy = self.latest_odom.twist.twist.linear.y
+        vz = self.latest_odom.twist.twist.linear.z
+        
+        roll, pitch, yaw = self._get_euler_from_quaternion(self.latest_odom.pose.pose.orientation)
 
-        target_vec_n = 0.0 - x
-        target_vec_e = 0.0 - y
-        target_vec_d = 0.0 - z
+        # Target is global [0, 0, 0]. Vector pointing FROM drone TO target:
+        target_vec_x = 0.0 - x
+        target_vec_y = 0.0 - y
+        target_vec_z = 0.0 - z
 
-        pad_rel_fwd = target_vec_n * math.cos(yaw) + target_vec_e * math.sin(yaw)
-        pad_rel_right = -target_vec_n * math.sin(yaw) + target_vec_e * math.cos(yaw)
-        pad_rel_down = target_vec_d
+        # Rotate world vector into Body Frame (Forward, Left, Up)
+        pad_rel_fwd = target_vec_x * math.cos(yaw) + target_vec_y * math.sin(yaw)
+        pad_rel_left = -target_vec_x * math.sin(yaw) + target_vec_y * math.cos(yaw)
+        pad_rel_up = target_vec_z
 
         return np.array([
             x, y, z, 
             vx, vy, vz, 
             roll, pitch, yaw, 
-            pad_rel_fwd, pad_rel_right, pad_rel_down
+            pad_rel_fwd, pad_rel_left, pad_rel_up
         ], dtype=np.float32)
 
     def _compute_reward_and_termination(self):
-        """Calculates dense reward, penalties, and checks episode boundaries."""
+        """Calculates dense reward based on distance, smoothness, and altitude."""
         if self.latest_odom is None:
             return 0.0, False
 
-        x, y, z = self.latest_odom.position
-        vx, vy, vz = self.latest_odom.velocity
-        roll, pitch, yaw = self._get_euler_from_quaternion(self.latest_odom.q)
+        x = self.latest_odom.pose.pose.position.x
+        y = self.latest_odom.pose.pose.position.y
+        z = self.latest_odom.pose.pose.position.z
+        roll, pitch, yaw = self._get_euler_from_quaternion(self.latest_odom.pose.pose.orientation)
 
         d_lat = math.hypot(x, y)
-        d_alt = abs(z) 
+        d_alt = abs(z)  # Z is already positive (Up)
         
         w1 = 1.0  
         w2 = 0.5  
         w_jerk = 0.05
         w_yaw = 0.2
 
+        # Reward = negative distance
         reward = - (w1 * d_lat + w2 * d_alt)
-
+        
+        # Jerk Penalty
         jerk = np.sum((self.current_action - self.previous_action)**2)
         reward -= (w_jerk * jerk)
 
+        # Yaw Alignment Penalty
         desired_yaw = math.atan2(0.0 - y, 0.0 - x)
         yaw_error = math.atan2(math.sin(desired_yaw - yaw), math.cos(desired_yaw - yaw))
         reward -= (w_yaw * abs(yaw_error))
 
         terminated = False
         
+        # Crash Condition 1: Flipped
         if abs(roll) > math.radians(45) or abs(pitch) > math.radians(45):
             terminated = True
             reward -= 100.0
-            print(f"[DEBUG] Episode Terminated: CRASH (Flipped) - Roll: {math.degrees(roll):.1f}°, Pitch: {math.degrees(pitch):.1f}°")
+            print(f"[DEBUG] CRASH: Flipped over! Roll: {math.degrees(roll):.1f}, Pitch: {math.degrees(pitch):.1f}")
             
+        # Crash Condition 2: Out of Bounds
         elif d_lat > 5.0:
             terminated = True
             reward -= 50.0
-            print(f"[DEBUG] Episode Terminated: OUT OF BOUNDS - Lateral Dist: {d_lat:.2f}m")
+            print(f"[DEBUG] CRASH: Strayed out of bounds. Distance: {d_lat:.2f}m")
             
-        elif z >= 0.0:
+        # Ground Condition: Z drops to roughly floor level
+        elif z <= 0.01:
             terminated = True
-            if d_lat < 0.2 and abs(vz) < 0.5:
+            # Success: Inside 20cm radius
+            if d_lat < 0.2:
                 reward += 100.0
-                print(f"[DEBUG] Episode Terminated: SUCCESSFUL LANDING!")
+                print("[DEBUG] SUCCESS: Landed on the pad!")
             else:
                 reward -= 100.0
-                print(f"[DEBUG] Episode Terminated: CRASH (Ground Impact) - Vz: {vz:.2f}m/s, Dist: {d_lat:.2f}m")
+                print(f"[DEBUG] CRASH: Hit the ground away from pad. Z={z:.3f}, Dist={d_lat:.2f}m")
 
         return float(reward), terminated
 
