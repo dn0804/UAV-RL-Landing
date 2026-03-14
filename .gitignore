@@ -4,6 +4,8 @@ ros2_ws/install/
 ros2_ws/log/
 ros2_ws/logs/
 
+ros2_ws/src/px4_msgs/
+
 # Python caches
 __pycache__/
 *.pyc
@@ -21,3 +23,7 @@ docker-compose.override.yml
 ros2_ws/models/
 *.zip
 events.out.tfevents.*
+
+# IDE and Editor Configurations
+.vscode/
+.devcontainer/
