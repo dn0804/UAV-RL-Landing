@@ -4,7 +4,7 @@ stable-baselines3[extra]==2.2.1
 numpy<2.0.0
 
 # Vision
-opencv-python-headless==4.9.0.80
+opencv-contrib-python-headless==4.9.0.80
 
 # Utilities
 tensorboard

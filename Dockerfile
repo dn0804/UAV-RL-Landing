@@ -33,6 +33,8 @@ RUN wget https://packages.osrfoundation.org/gazebo.gpg -O /usr/share/keyrings/pk
     libgz-sensors7-dev \
     libgz-math7-dev \
     ros-humble-ros-gzgarden \
+    ros-humble-rqt-image-view \
+    ros-humble-cv-bridge \
     python3-colcon-common-extensions \
     && rm -rf /var/lib/apt/lists/*
 

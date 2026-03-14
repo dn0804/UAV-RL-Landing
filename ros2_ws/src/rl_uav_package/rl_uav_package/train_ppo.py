@@ -1,81 +1,244 @@
+"""
+PPO training entry point for autonomous UAV landing.
+
+Usage:
+    # Stage 1 baseline, 500k steps
+    ros2 run rl_uav_package train_ppo
+
+    # Or directly:
+    python3 -m rl_uav_package.train_ppo --total-timesteps 500000 --stage 1
+
+    # Resume from checkpoint:
+    python3 -m rl_uav_package.train_ppo --resume models/ppo_landing/latest.zip
+"""
+
+import argparse
 import os
-import rclpy
+import sys
+import time
+
+import numpy as np
+import torch as th
 from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-# Adjust this import based on your exact ROS 2 package structure
+from rl_uav_package.config.constants import (
+    PPO_CONFIG, NET_ARCH, ACTIVATION_FN,
+)
 from rl_uav_package.envs.drone_env import DroneEnv
+from rl_uav_package.utils.training_logger import TrainingLogger
+from rl_uav_package.curriculum.manager import CurriculumManager
 
-def main():
-    # 1. Define paths for saving models and logs
-    models_dir = "models/ppo_landing"
-    log_dir = "logs/"
 
-    os.makedirs(models_dir, exist_ok=True)
-    os.makedirs(log_dir, exist_ok=True)
+# ── Linear learning rate schedule ────────────────────────────────────
 
-    print("[INFO] Initializing Drone Environment...")
-    
-    # 2. Instantiate the environment
-    # The DroneEnv handles its own rclpy.init() and background thread
-    raw_env = DroneEnv()
+def linear_schedule(initial_lr: float):
+    """Return a callable that decays the learning rate linearly to 0.
 
-    # 3. Sanity Check
-    # SB3 provides a checker to ensure the custom environment follows Gymnasium API rules.
-    # We run this before training to catch shape/dtype mismatches early.
-    print("[INFO] Running SB3 Environment Checker...")
-    try:
-        check_env(raw_env, warn=True)
-        print("[INFO] Environment check passed!")
-    except Exception as e:
-        print(f"[ERROR] Environment check failed: {e}")
-        raw_env.close()
-        return
+    SB3 calls this function with progress_remaining ∈ [1.0, 0.0],
+    where 1.0 is the start of training and 0.0 is the end.
+    """
+    def schedule(progress_remaining: float) -> float:
+        return initial_lr * progress_remaining
+    return schedule
 
-    # 4. Vectorize the environment
-    # Stable-Baselines3 requires environments to be vectorized. 
-    # We MUST use DummyVecEnv (single thread) rather than SubprocVecEnv (multiprocessing) 
-    # because duplicating ROS 2 nodes with identical names/topics in parallel processes will crash.
+
+# ── Activation function resolution ──────────────────────────────────
+
+ACTIVATION_MAP = {
+    "Tanh": th.nn.Tanh,
+    "ReLU": th.nn.ReLU,
+}
+
+
+# ── Main ────────────────────────────────────────────────────────────
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Train PPO agent for UAV precision landing.",
+    )
+    parser.add_argument(
+        "--total-timesteps", type=int, default=500_000,
+        help="Total training timesteps (default: 500k for Stage 1 baseline).",
+    )
+    parser.add_argument(
+        "--stage", type=int, default=1, choices=[1, 2, 3],
+        help="Curriculum stage to train in (default: 1).",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=0,
+        help="Random seed for reproducibility.",
+    )
+    parser.add_argument(
+        "--resume", type=str, default=None,
+        help="Path to a saved model .zip to resume training from.",
+    )
+    parser.add_argument(
+        "--models-dir", type=str, default="models/ppo_landing",
+        help="Directory to save model checkpoints.",
+    )
+    parser.add_argument(
+        "--log-dir", type=str, default="logs/",
+        help="TensorBoard log directory.",
+    )
+    parser.add_argument(
+        "--run-name", type=str, default=None,
+        help="TensorBoard run name. Auto-generated if not provided.",
+    )
+    parser.add_argument(
+        "--skip-env-check", action="store_true",
+        help="Skip the SB3 environment checker (faster startup).",
+    )
+    parser.add_argument(
+        "--checkpoint-freq", type=int, default=50_000,
+        help="Save a checkpoint every N timesteps.",
+    )
+    parser.add_argument(
+        "--no-curriculum", action="store_true",
+        help="Disable curriculum progression.  Train on a single stage only.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+
+    os.makedirs(args.models_dir, exist_ok=True)
+    os.makedirs(args.log_dir, exist_ok=True)
+
+    # ── Run name ─────────────────────────────────────────────────
+    if args.run_name is None:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        args.run_name = f"PPO_stage{args.stage}_{timestamp}"
+
+    print(f"[INFO] Run: {args.run_name}")
+    print(f"[INFO] Stage: {args.stage}")
+    print(f"[INFO] Timesteps: {args.total_timesteps:,}")
+    print(f"[INFO] Seed: {args.seed}")
+
+    # ── Environment ──────────────────────────────────────────────
+    print("[INFO] Creating environment...")
+    raw_env = DroneEnv(initial_stage=args.stage, seed=args.seed)
+
+    if not args.skip_env_check:
+        print("[INFO] Running SB3 environment checker...")
+        try:
+            check_env(raw_env, warn=True)
+            print("[INFO] Environment check passed.")
+        except Exception as e:
+            print(f"[ERROR] Environment check failed: {e}")
+            raw_env.close()
+            return 1
+
+    # DummyVecEnv (single process) — SubprocVecEnv would duplicate
+    # ROS 2 nodes with identical names, causing crashes.
     env = DummyVecEnv([lambda: raw_env])
 
-    # 5. Initialize the PPO Agent
-    # MlpPolicy: Uses a standard Multi-Layer Perceptron (no CNNs, since we have a flat state vector)
-    # verbose=1: Prints training metrics to the console
-    print("[INFO] Initializing PPO Agent...")
-    model = PPO(
-        "MlpPolicy",
-        env,
-        verbose=1,
-        tensorboard_log=log_dir,
-        learning_rate=0.0003,
-        n_steps=2048,
-        batch_size=64,
+    # ── Resolve activation function ──────────────────────────────
+    activation_cls = ACTIVATION_MAP.get(ACTIVATION_FN)
+    if activation_cls is None:
+        print(f"[ERROR] Unknown activation: {ACTIVATION_FN}")
+        env.close()
+        return 1
+
+    # ── Policy kwargs ────────────────────────────────────────────
+    policy_kwargs = dict(
+        net_arch=NET_ARCH,
+        activation_fn=activation_cls,
     )
 
-    # 6. Execute the Integration Test Training Loop
-    # 10,000 steps is very short (about 16 minutes of simulated flight at 10Hz)
-    # but it is enough to prove the physics engine, ROS bridge, and RL agent are talking.
-    total_timesteps = 10_000
-    
-    print(f"[INFO] Starting training for {total_timesteps} timesteps...")
+    # ── Create or load model ─────────────────────────────────────
+    if args.resume:
+        print(f"[INFO] Resuming from {args.resume}")
+        model = PPO.load(
+            args.resume,
+            env=env,
+            tensorboard_log=args.log_dir,
+        )
+        # Override LR schedule for remaining training
+        model.learning_rate = linear_schedule(PPO_CONFIG["learning_rate"])
+    else:
+        print("[INFO] Initializing new PPO agent...")
+        model = PPO(
+            "MlpPolicy",
+            env,
+            learning_rate=linear_schedule(PPO_CONFIG["learning_rate"]),
+            gamma=PPO_CONFIG["gamma"],
+            gae_lambda=PPO_CONFIG["gae_lambda"],
+            clip_range=PPO_CONFIG["clip_range"],
+            n_epochs=PPO_CONFIG["n_epochs"],
+            batch_size=PPO_CONFIG["batch_size"],
+            n_steps=PPO_CONFIG["n_steps"],
+            ent_coef=PPO_CONFIG["ent_coef"],
+            vf_coef=PPO_CONFIG["vf_coef"],
+            max_grad_norm=PPO_CONFIG["max_grad_norm"],
+            policy_kwargs=policy_kwargs,
+            verbose=1,
+            seed=args.seed,
+            tensorboard_log=args.log_dir,
+        )
+
+    # Print param count for verification
+    total_params = sum(
+        p.numel() for p in model.policy.parameters()
+    )
+    print(f"[INFO] Policy parameters: {total_params:,}")
+
+    # ── Callbacks ────────────────────────────────────────────────
+    training_logger = TrainingLogger(window_size=200, verbose=1)
+
+    callbacks = [
+        training_logger,
+        CheckpointCallback(
+            save_freq=args.checkpoint_freq,
+            save_path=args.models_dir,
+            name_prefix="ppo_checkpoint",
+            save_replay_buffer=False,
+            save_vecnormalize=False,
+        ),
+    ]
+
+    if not args.no_curriculum:
+        curriculum = CurriculumManager(
+            spawner=raw_env.spawner,
+            training_logger=training_logger,
+            seed=args.seed,
+            verbose=1,
+        )
+        callbacks.append(curriculum)
+        print("[INFO] Curriculum manager enabled.")
+    else:
+        print(f"[INFO] Curriculum disabled. Training on stage {args.stage} only.")
+
+    # ── Train ────────────────────────────────────────────────────
+    print(f"[INFO] Starting training for {args.total_timesteps:,} timesteps...")
     try:
-        model.learn(total_timesteps=total_timesteps, tb_log_name="PPO_integration_test")
-        
-        # 7. Save the test model
-        model_path = os.path.join(models_dir, "ppo_test_model")
-        model.save(model_path)
-        print(f"[INFO] Model saved to {model_path}.zip")
+        model.learn(
+            total_timesteps=args.total_timesteps,
+            callback=callbacks,
+            tb_log_name=args.run_name,
+            reset_num_timesteps=(args.resume is None),
+        )
+
+        # Save final model
+        final_path = os.path.join(args.models_dir, "latest")
+        model.save(final_path)
+        print(f"[INFO] Final model saved to {final_path}.zip")
 
     except KeyboardInterrupt:
-        print("\n[INFO] Training interrupted by user. Saving current model...")
-        model_path = os.path.join(models_dir, "ppo_interrupted_model")
-        model.save(model_path)
-        
+        print("\n[INFO] Training interrupted. Saving...")
+        interrupted_path = os.path.join(args.models_dir, "interrupted")
+        model.save(interrupted_path)
+        print(f"[INFO] Interrupted model saved to {interrupted_path}.zip")
+
     finally:
-        # 8. Clean up ROS 2 nodes and threads safely
-        print("[INFO] Shutting down environment...")
+        print("[INFO] Shutting down...")
         env.close()
 
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
