@@ -44,6 +44,8 @@ def check_termination(
     d_pad: float,
     yaw_error: float,
     step: int,
+    success_vz_max: float = SUCCESS_VZ_MAX,
+    success_vxy_max: float = SUCCESS_VXY_MAX,
 ) -> tuple[bool, bool, str, float]:
     """Evaluate all episode-ending conditions.
 
@@ -94,16 +96,26 @@ def check_termination(
 
         success = (
             d_pad < SUCCESS_D_XY_MAX
-            and abs(vz) < SUCCESS_VZ_MAX
-            and v_xy < SUCCESS_VXY_MAX
+            and abs(vz) < success_vz_max
+            and v_xy < success_vxy_max
             and abs(yaw_error) < SUCCESS_YAW_ERROR_MAX
         )
 
         if success:
             return True, False, OUTCOME_SUCCESS, R_SUCCESS
         else:
-            return True, False, OUTCOME_CRASH_CONTACT, R_CRASH
+            # Graduated penalty based on how close ALL success criteria were.
+            # Each factor is 0.0 (perfect) to 1.0 (far from meeting).
+            pos_miss = min(d_pad / 0.50, 1.0)
+            vxy_miss = min(math.hypot(vx, vy) / 1.0, 1.0)
+            vz_miss = min(abs(vz) / 1.0, 1.0)
+            yaw_miss = min(abs(yaw_error) / math.pi, 1.0)
 
+            # Average of all miss factors — 0.0 = nearly perfect, 1.0 = way off
+            miss = (pos_miss + vxy_miss + vz_miss + yaw_miss) / 4.0
+            graduated_penalty = -5.0 - 45.0 * miss
+
+            return True, False, OUTCOME_CRASH_CONTACT, graduated_penalty
     # ------------------------------------------------------------------
     # 3. Below-pad breach — drone altitude below the landing surface
     #    No useful recovery exists from below the desk.

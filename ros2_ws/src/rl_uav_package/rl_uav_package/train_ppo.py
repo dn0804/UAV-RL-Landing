@@ -8,7 +8,7 @@ Usage:
     # Or directly:
     python3 -m rl_uav_package.train_ppo --total-timesteps 500000 --stage 1
 
-    # Resume from checkpoint:
+    # Resume from checkpoint:       
     python3 -m rl_uav_package.train_ppo --resume models/ppo_landing/latest.zip
 """
 
@@ -35,13 +35,13 @@ from rl_uav_package.curriculum.manager import CurriculumManager
 # ── Linear learning rate schedule ────────────────────────────────────
 
 def linear_schedule(initial_lr: float):
-    """Return a callable that decays the learning rate linearly to 0.
+    """Return a callable that decays the learning rate linearly to 0.3.
 
-    SB3 calls this function with progress_remaining ∈ [1.0, 0.0],
-    where 1.0 is the start of training and 0.0 is the end.
+    SB3 calls this function with progress_remaining ∈ [1.0, 0.3],
+    where 1.0 is the start of training and 0.3 is the end.
     """
     def schedule(progress_remaining: float) -> float:
-        return initial_lr * progress_remaining
+        return initial_lr # * (0.3 + 0.7 * progress_remaining)
     return schedule
 
 
@@ -64,8 +64,8 @@ def parse_args(argv=None):
         help="Total training timesteps (default: 500k for Stage 1 baseline).",
     )
     parser.add_argument(
-        "--stage", type=int, default=1, choices=[1, 2, 3],
-        help="Curriculum stage to train in (default: 1).",
+        "--stage", type=int, default=0, choices=[0, 1, 2, 3, 4],
+        help="Curriculum stage to train in (default: 0).",
     )
     parser.add_argument(
         "--seed", type=int, default=0,
@@ -187,7 +187,7 @@ def main(argv=None):
     print(f"[INFO] Policy parameters: {total_params:,}")
 
     # ── Callbacks ────────────────────────────────────────────────
-    training_logger = TrainingLogger(window_size=200, verbose=1)
+    training_logger = TrainingLogger(window_size=200, verbose=0)
 
     callbacks = [
         training_logger,

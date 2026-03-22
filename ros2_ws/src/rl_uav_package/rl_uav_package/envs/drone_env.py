@@ -21,6 +21,7 @@ import math
 import subprocess
 import threading
 import time
+import os
 
 import gymnasium as gym
 from gymnasium import spaces
@@ -38,6 +39,8 @@ from rl_uav_package.config.constants import (
     MARKER_Z, PAD_WORLD_POS, MARKER_WORLD_POS,
     LANDING_PAD_FORWARD_OFFSET,
     GZ_WORLD_NAME, GZ_DRONE_MODEL_NAME,
+    PAD_ELEVATION, CURRICULUM_STAGES,
+    SUCCESS_VZ_MAX, SUCCESS_VXY_MAX,
 )
 from rl_uav_package.envs.rewards import compute_reward
 from rl_uav_package.envs.termination import check_termination
@@ -53,14 +56,14 @@ class DroneEnv(gym.Env):
     Parameters
     ----------
     initial_stage : int
-        Curriculum stage to start in (1, 2, or 3).
+        Curriculum stage to start in (0, 1, 2, or 3).
     seed : int, optional
         Random seed for reproducibility.
     """
 
     metadata = {"render_modes": []}
 
-    def __init__(self, initial_stage: int = 1, seed: int = 0):
+    def __init__(self, initial_stage: int = 0, seed: int = 0):
         super().__init__()
 
         # ── Spaces ───────────────────────────────────────────────
@@ -113,6 +116,25 @@ class DroneEnv(gym.Env):
         # Spin ROS 2 in background
         self._spin_thread = threading.Thread(target=self._spin, daemon=True)
         self._spin_thread.start()
+
+        # Start persistent teleport helper (avoids subprocess-per-teleport)
+        helper_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            '..', '..', '..', '..', '..', 'scripts', 'gz_teleport_helper'
+        )
+        # Normalize the path
+        helper_path = os.path.normpath(helper_path)
+        self._teleport_proc = subprocess.Popen(
+            [helper_path, GZ_WORLD_NAME],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,  # line buffered
+        )
+        # Wait for READY
+        ready = self._teleport_proc.stdout.readline().strip()
+        self._node.get_logger().info(f"Teleport helper: {ready}")
 
         # Warmup: teleport the drone and let the physics engine + velocity
         # controller stabilize.  The first few teleports after Gazebo starts
@@ -170,6 +192,9 @@ class DroneEnv(gym.Env):
         # 5. Derived quantities
         derived = self._compute_derived(state)
 
+        # Get success thresholds for this curriculum stage
+        vz_thresh, vxy_thresh = self._get_success_thresholds()
+
         # 6. Termination (uses raw velocity for accurate touchdown checks)
         terminated, truncated, outcome, terminal_reward = check_termination(
             x=state["x"], y=state["y"], z=state["z"],
@@ -179,6 +204,8 @@ class DroneEnv(gym.Env):
             d_pad=derived["d_pad"],
             yaw_error=derived["yaw_error"],
             step=self._step_count,
+            success_vz_max=vz_thresh,
+            success_vxy_max=vxy_thresh
         )
 
         # Debug: log full state on step-1 crashes to diagnose stale odom
@@ -241,7 +268,7 @@ class DroneEnv(gym.Env):
     # X4 model falls briefly under gravity before the velocity controller
     # engages.  The buffer ensures the drone settles near the spawn height
     # rather than below PAD_ELEVATION.
-    _SPAWN_Z_BUFFER = 0.0  # m — tuning knob if needed
+    _SPAWN_Z_BUFFER = 0  # m — tuning knob if needed
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -251,14 +278,13 @@ class DroneEnv(gym.Env):
         # 1. Sample spawn position
         spawn = self._spawner.sample()
 
-        self._node.get_logger().info(
+        """self._node.get_logger().info(
             f"RESET: x={spawn['x']:.2f} y={spawn['y']:.2f} "
             f"z={spawn['z']:.2f} yaw={math.degrees(spawn['yaw']):.1f}°"
-        )
+        )"""
 
         # 2. Stop the drone, then teleport (with built-in retry + verification)
         self._publish_action(np.zeros(ACTION_DIM))
-        time.sleep(0.1)
         teleport_z = spawn["z"] + self._SPAWN_Z_BUFFER
         self._teleport(spawn["x"], spawn["y"], teleport_z, spawn["yaw"])
 
@@ -267,12 +293,12 @@ class DroneEnv(gym.Env):
 
         # 4. Extract settled state
         state = self._extract_state()
-        self._node.get_logger().info(
+        """self._node.get_logger().info(
             f"  Settled: pos=({state['x']:.2f}, {state['y']:.2f}, {state['z']:.2f}) "
             f"rpy=({math.degrees(state['roll']):.1f}°, "
             f"{math.degrees(state['pitch']):.1f}°, "
             f"{math.degrees(state['yaw']):.1f}°)"
-        )
+        )"""
 
         # 5. Reset sub-modules
         vel_initial = np.array([state["vx"], state["vy"], state["vz"]])
@@ -302,6 +328,9 @@ class DroneEnv(gym.Env):
 
     def close(self):
         self._node.get_logger().info("Shutting down DroneEnv.")
+        if self._teleport_proc and self._teleport_proc.poll() is None:
+            self._teleport_proc.terminate()
+            self._teleport_proc.wait(timeout=2.0)
         self._node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
@@ -336,69 +365,30 @@ class DroneEnv(gym.Env):
         """Delegate to module-level pure function."""
         return compute_derived(state)
 
+    def _get_success_thresholds(self) -> tuple[float, float]:
+        """Get velocity thresholds for the current curriculum stage."""
+        stage_cfg = CURRICULUM_STAGES.get(self._spawner.stage, {})
+        vz_max = stage_cfg.get("success_vz_max", SUCCESS_VZ_MAX)
+        vxy_max = stage_cfg.get("success_vxy_max", SUCCESS_VXY_MAX)
+        return vz_max, vxy_max
+
     # ── Gazebo interface ─────────────────────────────────────────
 
     def _teleport(self, x: float, y: float, z: float, yaw: float):
-        """Move the drone to a new pose via Gazebo service, with retry.
-
-        Verifies the teleport worked by checking odom after each attempt.
-        Retries up to 5 times if the drone didn't reach the target.
-        """
+        """Move the drone via the persistent teleport helper."""
         w = math.cos(yaw / 2.0)
         qz = math.sin(yaw / 2.0)
 
-        req = (
-            f'name: "{GZ_DRONE_MODEL_NAME}", '
-            f'position: {{x: {x}, y: {y}, z: {z}}}, '
-            f'orientation: {{w: {w}, x: 0.0, y: 0.0, z: {qz}}}'
-        )
+        cmd = f"{GZ_DRONE_MODEL_NAME} {x} {y} {z} {w} 0.0 0.0 {qz}\n"
+        self._teleport_proc.stdin.write(cmd)
+        self._teleport_proc.stdin.flush()
+        # Read response (OK or FAIL — either way teleport worked)
+        self._teleport_proc.stdout.readline()
 
-        cmd = [
-            "gz", "service",
-            "-s", f"/world/{GZ_WORLD_NAME}/set_pose",
-            "--reqtype", "gz.msgs.Pose",
-            "--reptype", "gz.msgs.Boolean",
-            "--timeout", "2000",
-            "--req", req,
-        ]
-
-        for attempt in range(5):
-            result = subprocess.run(cmd, capture_output=True, text=True)
-
-            if result.returncode != 0:
-                self._node.get_logger().warn(
-                    f"  Teleport service call failed (attempt {attempt + 1}): "
-                    f"{result.stderr.strip()}"
-                )
-
-            # Wait for physics to process the teleport
-            time.sleep(0.2)
-
-            # Flush stale odom and read fresh position
-            for _ in range(3):
-                self._odom_event.clear()
-                self._odom_event.wait(timeout=0.2)
-
-            state = self._extract_state()
-            pos_error = math.sqrt(
-                (state["x"] - x) ** 2 +
-                (state["y"] - y) ** 2 +
-                (state["z"] - z) ** 2
-            )
-
-            if pos_error < 0.3:
-                return  # success
-
-            self._node.get_logger().warn(
-                f"  Teleport verify failed (attempt {attempt + 1}): "
-                f"target=({x:.2f}, {y:.2f}, {z:.2f}), "
-                f"actual=({state['x']:.2f}, {state['y']:.2f}, {state['z']:.2f}), "
-                f"error={pos_error:.2f}m"
-            )
-
-        self._node.get_logger().error(
-            f"  Teleport failed after 5 attempts! Continuing with current pose."
-        )
+        # Flush stale odom
+        for _ in range(2):
+            self._odom_event.clear()
+            self._odom_event.wait(timeout=0.1)
 
     def _publish_action(self, action: np.ndarray):
         """Send velocity command to the drone."""
@@ -467,7 +457,15 @@ def compute_derived(state: dict) -> dict:
         math.cos(state["yaw"] - bearing),
     )
 
-    z_tof_raw = z
+    # Determine surface height below the drone.
+    # Desk occupies x=[0, 0.60], y=[-0.50, 0.50], top at PAD_ELEVATION.
+    # Everywhere else, the surface is the ground (z=0).
+    if 0.0 <= x <= 0.60 and -0.50 <= y <= 0.50:
+        surface_below = PAD_ELEVATION
+    else:
+        surface_below = 0.0
+
+    z_tof_raw = max(z - surface_below, 0.0)
     z_tof = z_tof_raw * math.cos(state["pitch"]) * math.cos(state["roll"])
 
     return {
