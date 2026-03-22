@@ -41,7 +41,7 @@ def linear_schedule(initial_lr: float):
     where 1.0 is the start of training and 0.3 is the end.
     """
     def schedule(progress_remaining: float) -> float:
-        return initial_lr # * (0.3 + 0.7 * progress_remaining)
+        return initial_lr * (0.1 + 0.7 * progress_remaining)
     return schedule
 
 
@@ -64,7 +64,7 @@ def parse_args(argv=None):
         help="Total training timesteps (default: 500k for Stage 1 baseline).",
     )
     parser.add_argument(
-        "--stage", type=int, default=0, choices=[0, 1, 2, 3, 4],
+        "--stage", type=int, default=0, choices=[0, 1, 2, 3, 4, 5],
         help="Curriculum stage to train in (default: 0).",
     )
     parser.add_argument(
@@ -156,9 +156,11 @@ def main(argv=None):
             args.resume,
             env=env,
             tensorboard_log=args.log_dir,
+            learning_rate=linear_schedule(PPO_CONFIG["learning_rate"]),
         )
+        model.ent_coef = 0.001 # Override entropy coefficient for remaining training
         # Override LR schedule for remaining training
-        model.learning_rate = linear_schedule(PPO_CONFIG["learning_rate"])
+        model.lr_schedule = model.learning_rate
     else:
         print("[INFO] Initializing new PPO agent...")
         model = PPO(

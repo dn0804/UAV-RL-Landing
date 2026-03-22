@@ -86,10 +86,15 @@
       <link name="link">
         <visual name="visual">
           <geometry><box><size>0.01 0.20 0.20</size></box></geometry>
-          <material>
-            <ambient>0.9 0.9 0.9 1</ambient>
-            <diffuse>0.9 0.9 0.9 1</diffuse>
-          </material>
+            <material>
+              <ambient>0.9 0.9 0.9 1</ambient>
+              <diffuse>0.9 0.9 0.9 1</diffuse>
+              <pbr>
+                <metal>
+                  <albedo_map>aruco_marker.png</albedo_map>
+                </metal>
+              </pbr>
+            </material>
         </visual>
       </link>
     </model>

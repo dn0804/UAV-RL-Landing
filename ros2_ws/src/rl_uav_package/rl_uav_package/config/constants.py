@@ -196,6 +196,17 @@ CURRICULUM_STAGES = {
         "success_vxy_max": 0.2,
     },
     4: {
+        "name": "full_cone_moderate_landing",
+        "d_min": 0.3,
+        "d_max": 4.0,
+        "angle_max": math.radians(60),
+        "furniture_count": (1, 5),
+        "vision_dropout_rate": 0.02,
+        "odom_noise_tier": 3,
+        "success_vz_max": 0.7,
+        "success_vxy_max": 0.5,
+    },
+    5: {
         "name": "full_cone",
         "d_min": 0.3,
         "d_max": 4.0,
@@ -204,7 +215,7 @@ CURRICULUM_STAGES = {
         "vision_dropout_rate": 0.02,
         "odom_noise_tier": 3,
         "success_vz_max": 0.3,
-        "success_vxy_max": 0.2,
+        "success_vxy_max": 0.25,
     },
 }
 
@@ -219,7 +230,7 @@ CURRICULUM_BLEND_STEPS = 5              # number of ratio steps (80/20â†’60/40â†
 # ============================================================
 
 PPO_CONFIG = {
-    "learning_rate": 3e-4,
+    "learning_rate": 0.00015,
     "gamma": 0.99,
     "gae_lambda": 0.95,
     "clip_range": 0.2,

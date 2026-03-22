@@ -14,6 +14,7 @@ def generate_launch_description():
     gazebo = ExecuteProcess(
         cmd=['gz', 'sim', '-s', '-r', world_file],
         output='log',
+        additional_env={'GZ_SIM_RESOURCE_PATH': launch_dir},
     )
 
     # 2. The ROS 2 <-> Gazebo Bridge
