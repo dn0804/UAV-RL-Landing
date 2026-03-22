@@ -89,7 +89,7 @@ W_HORIZONTAL = 10.0
 W_DESCENT = 20.0
 DESCENT_GATE_H_MID = 0.6    # m above marker where sigmoid is 50%
 DESCENT_GATE_TAU = 0.1      # sigmoid steepness
-DESCENT_GATE_SIGMA = 0.10   # m; Gaussian centering width = pad radius
+DESCENT_GATE_SIGMA = 0.20   # m; Gaussian centering width = pad radius
 
 # Marker tracking / yaw-to-bearing  (§8.5)
 W_YAW = 0.3
@@ -99,7 +99,7 @@ YAW_PENALTY_D_MIN = 0.3     # m; penalty floor distance (caps at close range)
 W_JERK = 0.1
 
 # Time penalty  (§8.6)
-W_TIME = 0.1
+W_TIME = 0.2
 
 # Terminal rewards  (§8.9)
 R_SUCCESS = 100.0
@@ -122,8 +122,8 @@ TOF_CONTACT_THRESHOLD = 0.10  # m; any ToF below this = surface contact
 
 # Success criteria (all must be met simultaneously)
 SUCCESS_D_XY_MAX = 0.10      # m; horizontal distance to pad center
-SUCCESS_VZ_MAX = 0.3         # m/s; vertical speed at touchdown
-SUCCESS_VXY_MAX = 0.2        # m/s; horizontal speed at touchdown
+SUCCESS_VZ_MAX = 1.5         # m/s; vertical speed at touchdown
+SUCCESS_VXY_MAX = 1.0        # m/s; horizontal speed at touchdown
 SUCCESS_YAW_ERROR_MAX = math.radians(15)  # rad; heading alignment
 
 # Crash: attitude limits
@@ -151,32 +151,60 @@ EMA_ALPHA = 0.4  # smoothing parameter; τ ≈ 0.25 s at 10 Hz
 # ============================================================
 
 CURRICULUM_STAGES = {
+    0: {
+        "name": "relaxed_landing",
+        "d_min": 0.3,
+        "d_max": 0.8,
+        "angle_max": math.radians(10),
+        "furniture_count": (0, 0),
+        "vision_dropout_rate": 0.0,
+        "odom_noise_tier": 1,
+        "success_vz_max": 1.5,
+        "success_vxy_max": 1.0,
+    },
     1: {
-        "name": "close_range",
-        "d_min": 0.3,         # m
-        "d_max": 0.8,         # m
-        "angle_max": math.radians(10),  # approach angle from wall normal
-        "furniture_count": (0, 0),       # (min, max)
-        "vision_dropout_rate": 0.0,      # per-step probability
-        "odom_noise_tier": 1,            # Gaussian only
+        "name": "moderate_landing",
+        "d_min": 0.3,
+        "d_max": 0.8,
+        "angle_max": math.radians(10),
+        "furniture_count": (0, 0),
+        "vision_dropout_rate": 0.0,
+        "odom_noise_tier": 1,
+        "success_vz_max": 0.5,
+        "success_vxy_max": 0.5,
     },
     2: {
+        "name": "precision_landing",
+        "d_min": 0.3,
+        "d_max": 0.8,
+        "angle_max": math.radians(10),
+        "furniture_count": (0, 0),
+        "vision_dropout_rate": 0.0,
+        "odom_noise_tier": 1,
+        "success_vz_max": 0.3,
+        "success_vxy_max": 0.2,
+    },
+    3: {
         "name": "medium_range",
         "d_min": 0.5,
         "d_max": 1.5,
         "angle_max": math.radians(25),
         "furniture_count": (1, 3),
         "vision_dropout_rate": 0.01,
-        "odom_noise_tier": 2,            # Gaussian + bias drift
+        "odom_noise_tier": 2,
+        "success_vz_max": 0.3,
+        "success_vxy_max": 0.2,
     },
-    3: {
+    4: {
         "name": "full_cone",
         "d_min": 0.3,
         "d_max": 4.0,
         "angle_max": math.radians(60),
         "furniture_count": (1, 5),
         "vision_dropout_rate": 0.02,
-        "odom_noise_tier": 3,            # Gaussian + drift + freeze
+        "odom_noise_tier": 3,
+        "success_vz_max": 0.3,
+        "success_vxy_max": 0.2,
     },
 }
 
@@ -191,7 +219,7 @@ CURRICULUM_BLEND_STEPS = 5              # number of ratio steps (80/20→60/40�
 # ============================================================
 
 PPO_CONFIG = {
-    "learning_rate": 3e-4,       # with linear decay to 0
+    "learning_rate": 3e-4,
     "gamma": 0.99,
     "gae_lambda": 0.95,
     "clip_range": 0.2,

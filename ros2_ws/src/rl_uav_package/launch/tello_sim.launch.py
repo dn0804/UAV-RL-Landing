@@ -13,7 +13,7 @@ def generate_launch_description():
     # 1. Start Gazebo headless with our world
     gazebo = ExecuteProcess(
         cmd=['gz', 'sim', '-s', '-r', world_file],
-        output='screen',
+        output='log',
     )
 
     # 2. The ROS 2 <-> Gazebo Bridge
@@ -32,7 +32,7 @@ def generate_launch_description():
             ('/model/tello/odometry', '/odom'),
             ('/camera/image_raw', '/camera/image_raw')
         ],
-        output='screen'
+        output='log'
     )
 
     return LaunchDescription([gazebo, bridge])
