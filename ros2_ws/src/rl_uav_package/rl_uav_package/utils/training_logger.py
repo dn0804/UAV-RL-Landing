@@ -57,6 +57,17 @@ DIAG_KEYS = [
     "diag/delta_z",
 ]
 
+# Terminal breakdown keys from termination.py (present only on final step)
+TERMINAL_KEYS = [
+    "terminal/vz_bonus",
+    "terminal/vxy_bonus",
+    "terminal/miss_pos",
+    "terminal/miss_vxy",
+    "terminal/miss_vz",
+    "terminal/miss_yaw",
+    "terminal/miss_avg",
+]
+
 
 class TrainingLogger(BaseCallback):
     """Rich TensorBoard logging callback for PPO training.
@@ -171,6 +182,11 @@ class TrainingLogger(BaseCallback):
             self.logger.record("episode/final_vz", info["final_vz"])
         if "final_vxy" in info:
             self.logger.record("episode/final_vxy", info["final_vxy"])
+
+        # ── Terminal reward breakdown (bonuses / miss factors) ─
+        for key in TERMINAL_KEYS:
+            if key in info:
+                self.logger.record(key, info[key])
 
         # ── Per-episode reward breakdown ─────────────────────
         if self._episode_count % self._log_reward_freq == 0:

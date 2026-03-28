@@ -25,12 +25,11 @@ from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from rl_uav_package.config.constants import (
-    PPO_CONFIG, NET_ARCH, ACTIVATION_FN,
+    PPO_CONFIG, NET_ARCH, ACTIVATION_FN, LOG_STD_INIT
 )
 from rl_uav_package.envs.drone_env import DroneEnv
 from rl_uav_package.utils.training_logger import TrainingLogger
 from rl_uav_package.curriculum.manager import CurriculumManager
-
 
 # ── Linear learning rate schedule ────────────────────────────────────
 
@@ -64,7 +63,7 @@ def parse_args(argv=None):
         help="Total training timesteps (default: 500k for Stage 1 baseline).",
     )
     parser.add_argument(
-        "--stage", type=int, default=0, choices=[0, 1, 2, 3, 4, 5],
+        "--stage", type=int, default=0, choices=[0, 1, 2, 3, 4, 5, 6],
         help="Curriculum stage to train in (default: 0).",
     )
     parser.add_argument(
@@ -147,6 +146,7 @@ def main(argv=None):
     policy_kwargs = dict(
         net_arch=NET_ARCH,
         activation_fn=activation_cls,
+        log_std_init=LOG_STD_INIT,
     )
 
     # ── Create or load model ─────────────────────────────────────

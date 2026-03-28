@@ -44,7 +44,7 @@ PAD_WORLD_POS = (LANDING_PAD_FORWARD_OFFSET, 0.0, PAD_ELEVATION)  # in front of 
 #   [8]  dropout_t  steps since last marker detection (§6.4)
 #   [9..28]         prev_actions: 5 steps × 4 axes (§6.3)
 
-OBS_DIM = 29
+OBS_DIM = 31
 ACTION_DIM = 4
 ACTION_HISTORY_STEPS = 5  # number of past actions in obs  (§6.3)
 
@@ -60,6 +60,8 @@ OBS_SCALE = np.array([
     2.0,    # vz
     2.5,    # z_tof    (§6.6: matches z scale)
     30.0,   # dropout  (§6.4: cap at 30 steps)
+    math.pi,# roll
+    math.pi,# pitch
 ] + [1.0] * (ACTION_HISTORY_STEPS * ACTION_DIM),  # prev actions already in [-1, 1]
     dtype=np.float32,
 )
@@ -86,39 +88,52 @@ ACTION_HIGH = 1.0
 W_HORIZONTAL = 10.0
 
 # Gated descent  (§8.4)
+# With real attitude dynamics the drone can't maintain perfect centering
+# while descending — pitching to correct position causes lateral drift.
+# sigma=0.10 (pad radius) was too tight; 0.20 allows partial descent
+# credit when roughly centered, matching the lesson from the odom
+# baseline training where this value "broke the hovering plateau."
 W_DESCENT = 20.0
 DESCENT_GATE_H_MID = 0.6    # m above marker where sigmoid is 50%
 DESCENT_GATE_TAU = 0.1      # sigmoid steepness
-DESCENT_GATE_SIGMA = 0.20   # m; Gaussian centering width = pad radius
+DESCENT_GATE_SIGMA = 0.20   # m; Gaussian centering width (2× pad radius)
 
 # Marker tracking / yaw-to-bearing  (§8.5)
-W_YAW = 0.3
+# With MulticopterMotorModel the drone's heading is harder to control
+# (attitude dynamics couple yaw with roll/pitch).  Reduced from 0.3
+# to 0.10 so yaw tracking doesn't dominate the reward signal during
+# early training.  Can be increased once the agent has learned basic
+# position control.
+W_YAW = 0.10
 YAW_PENALTY_D_MIN = 0.3     # m; penalty floor distance (caps at close range)
 
 # Jerk penalty  (§8.6)
-W_JERK = 0.1
+W_JERK = 0.02
 
 # Time penalty  (§8.6)
-W_TIME = 0.2
+W_TIME = 0.083
 
 # Terminal rewards  (§8.9)
 R_SUCCESS = 100.0
-R_CRASH = -100.0
-R_TIMEOUT = 0.0
+R_CRASH = -120.0
+R_TIMEOUT = -100.0
 
 # ============================================================
 # Episode Termination  (§8.9)
 # ============================================================
 
 # Operational volume
-X_MIN = 0.05    # m; wall collision boundary
+X_MIN = 0.08    # m; wall collision boundary — reduced from 0.05 for
+                #     attitude dynamics: the drone must pitch backward to
+                #     decelerate, which takes time and distance.  Gazebo
+                #     collision geometry prevents actual wall penetration.
 X_MAX = 5.0     # m; Stage 3 max + 1 m buffer
 Y_MIN = -4.0    # m
 Y_MAX = 4.0     # m
 Z_MAX = 2.5     # m; no useful trajectory above this
 
 # Surface contact
-TOF_CONTACT_THRESHOLD = 0.10  # m; any ToF below this = surface contact
+TOF_CONTACT_THRESHOLD = 0.03  # m; any ToF below this = surface contact
 
 # Success criteria (all must be met simultaneously)
 SUCCESS_D_XY_MAX = 0.10      # m; horizontal distance to pad center
@@ -159,10 +174,25 @@ CURRICULUM_STAGES = {
         "furniture_count": (0, 0),
         "vision_dropout_rate": 0.0,
         "odom_noise_tier": 1,
-        "success_vz_max": 1.5,
+        "success_vz_max": 1.2,
         "success_vxy_max": 1.0,
+        "success_d_xy_max": 0.25,
+        "success_yaw_error_max": math.radians(40),
     },
     1: {
+        "name": "easy_landing",
+        "d_min": 0.3,
+        "d_max": 0.8,
+        "angle_max": math.radians(10),
+        "furniture_count": (0, 0),
+        "vision_dropout_rate": 0.0,
+        "odom_noise_tier": 1,
+        "success_vz_max": 1,
+        "success_vxy_max": 0.75,
+        "success_d_xy_max": 0.225,
+        "success_yaw_error_max": math.radians(35),
+    },
+    2: {
         "name": "moderate_landing",
         "d_min": 0.3,
         "d_max": 0.8,
@@ -170,10 +200,12 @@ CURRICULUM_STAGES = {
         "furniture_count": (0, 0),
         "vision_dropout_rate": 0.0,
         "odom_noise_tier": 1,
-        "success_vz_max": 0.5,
+        "success_vz_max": .55,
         "success_vxy_max": 0.5,
+        "success_d_xy_max": 0.18,
+        "success_yaw_error_max": math.radians(30),
     },
-    2: {
+    3: {
         "name": "precision_landing",
         "d_min": 0.3,
         "d_max": 0.8,
@@ -181,10 +213,12 @@ CURRICULUM_STAGES = {
         "furniture_count": (0, 0),
         "vision_dropout_rate": 0.0,
         "odom_noise_tier": 1,
-        "success_vz_max": 0.3,
-        "success_vxy_max": 0.2,
+        "success_vz_max": 0.33,
+        "success_vxy_max": 0.25,
+        "success_d_xy_max": 0.15,
+        "success_yaw_error_max": math.radians(25),
     },
-    3: {
+    4: {
         "name": "medium_range",
         "d_min": 0.5,
         "d_max": 1.5,
@@ -193,9 +227,11 @@ CURRICULUM_STAGES = {
         "vision_dropout_rate": 0.01,
         "odom_noise_tier": 2,
         "success_vz_max": 0.3,
-        "success_vxy_max": 0.2,
+        "success_vxy_max": 0.225,
+        "success_d_xy_max": 0.125,
+        "success_yaw_error_max": math.radians(22),
     },
-    4: {
+    5: {
         "name": "full_cone_moderate_landing",
         "d_min": 0.3,
         "d_max": 4.0,
@@ -205,8 +241,10 @@ CURRICULUM_STAGES = {
         "odom_noise_tier": 3,
         "success_vz_max": 0.7,
         "success_vxy_max": 0.5,
+        "success_d_xy_max": 0.10,
+        "success_yaw_error_max": math.radians(18),
     },
-    5: {
+    6: {
         "name": "full_cone",
         "d_min": 0.3,
         "d_max": 4.0,
@@ -216,13 +254,15 @@ CURRICULUM_STAGES = {
         "odom_noise_tier": 3,
         "success_vz_max": 0.3,
         "success_vxy_max": 0.25,
+        "success_d_xy_max": 0.10,
+        "success_yaw_error_max": math.radians(15),
     },
 }
 
 # Stage transition  (§9, blended transitions)
-CURRICULUM_PROMOTION_THRESHOLD = 0.70   # success rate to trigger transition
+CURRICULUM_PROMOTION_THRESHOLD = 0.75   # success rate to trigger transition
 CURRICULUM_WINDOW_SIZE = 300            # rolling episode window for success rate
-CURRICULUM_BLEND_EPISODES = 200         # episodes over which to blend distributions
+CURRICULUM_BLEND_EPISODES = 1000        # episodes over which to blend distributions
 CURRICULUM_BLEND_STEPS = 5              # number of ratio steps (80/20→60/40→...)
 
 # ============================================================
@@ -237,7 +277,10 @@ PPO_CONFIG = {
     "n_epochs": 10,
     "batch_size": 64,
     "n_steps": 2048,             # rollout buffer per iteration
-    "ent_coef": 0.01,
+    "ent_coef": 0.005,           # reduced for attitude dynamics — motor
+                                  # physics already provide ample exploration
+                                  # noise; too much entropy prevents std
+                                  # from decreasing
     "vf_coef": 0.5,              # SB3 default
     "max_grad_norm": 0.5,        # SB3 default
 }
@@ -246,6 +289,14 @@ PPO_CONFIG = {
 # Separate policy and value networks, 2×128 Tanh
 NET_ARCH = dict(pi=[128, 128], vf=[128, 128])
 ACTIVATION_FN = "Tanh"  # string key; resolved in train_ppo.py
+
+# Initial action std — controls exploration noise at training start.
+# With real attitude dynamics, high std (default 1.0) produces chaotic
+# trajectories that make returns unpredictable, preventing the value
+# function from learning.  0.6 (log_std_init=-0.5) gives enough
+# exploration to discover success while keeping trajectories smooth
+# enough for the value function to extract signal.
+LOG_STD_INIT = -0.5  # initial std ≈ 0.6; use in policy_kwargs
 
 # ============================================================
 # Camera  (§5)

@@ -5,12 +5,12 @@ This is the central orchestrator.  It owns the ROS 2 node lifecycle, the
 Gymnasium step/reset loop, and Gazebo teleportation.  All computation is
 delegated to specialist modules:
 
-    rewards.py        → per-step shaping reward
-    termination.py    → episode-ending conditions
-    observations.py   → 29-dim normalized vector assembly
-    spawner.py        → rejection-sampled spawn positions
-    ema.py            → velocity smoothing
-    aruco_tracker.py  → dropout state (vision integration later)
+    rewards.py        -> per-step shaping reward
+    termination.py    -> episode-ending conditions
+    observations.py   -> 29-dim normalized vector assembly
+    spawner.py        -> rejection-sampled spawn positions
+    ema.py            -> velocity smoothing
+    aruco_tracker.py  -> dropout state (vision integration later)
 
 For the baseline (no domain randomization, no live vision), position comes
 from odom ground truth and z_tof is approximated as drone altitude above
@@ -31,7 +31,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Empty
+from std_msgs.msg import Empty, Bool
 
 from rl_uav_package.config.constants import (
     OBS_DIM, ACTION_DIM, ACTION_LOW, ACTION_HIGH,
@@ -41,6 +41,8 @@ from rl_uav_package.config.constants import (
     GZ_WORLD_NAME, GZ_DRONE_MODEL_NAME,
     PAD_ELEVATION, CURRICULUM_STAGES,
     SUCCESS_VZ_MAX, SUCCESS_VXY_MAX,
+    SUCCESS_D_XY_MAX, SUCCESS_YAW_ERROR_MAX,
+    Z_MAX,
 )
 from rl_uav_package.envs.rewards import compute_reward
 from rl_uav_package.envs.termination import check_termination
@@ -108,6 +110,7 @@ class DroneEnv(gym.Env):
         self._cmd_pub = self._node.create_publisher(Twist, "/cmd_vel", 10)
         self._takeoff_pub = self._node.create_publisher(Empty, "/takeoff", 10)
         self._land_pub = self._node.create_publisher(Empty, "/land", 10)
+        self._enable_pub = self._node.create_publisher(Bool, "/enable", 10)
 
         # Odom synchronization
         self._latest_odom = None
@@ -118,12 +121,20 @@ class DroneEnv(gym.Env):
         self._spin_thread.start()
 
         # Start persistent teleport helper (avoids subprocess-per-teleport)
-        helper_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            '..', '..', '..', '..', '..', 'scripts', 'gz_teleport_helper'
-        )
-        # Normalize the path
-        helper_path = os.path.normpath(helper_path)
+        # Dynamically search upwards to find the workspace root containing 'scripts'
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        helper_path = None
+        
+        while current_dir != '/':
+            potential_path = os.path.join(current_dir, 'scripts', 'gz_teleport_helper')
+            if os.path.exists(potential_path):
+                helper_path = potential_path
+                break
+            current_dir = os.path.dirname(current_dir)
+            
+        if helper_path is None:
+            raise FileNotFoundError("Could not find 'scripts/gz_teleport_helper' in any parent directory.")
+
         self._teleport_proc = subprocess.Popen(
             [helper_path, GZ_WORLD_NAME],
             stdin=subprocess.PIPE,
@@ -137,16 +148,26 @@ class DroneEnv(gym.Env):
         self._node.get_logger().info(f"Teleport helper: {ready}")
 
         # Warmup: teleport the drone and let the physics engine + velocity
-        # controller stabilize.  The first few teleports after Gazebo starts
-        # can produce transient bad states (residual velocity, stale odom).
-        # Running a few warmup cycles here burns through those before
-        # training begins.
+        # controller stabilize.  With MulticopterMotorModel, the first few
+        # teleports after Gazebo starts need extra settling time for the
+        # rotors to spool up and the PID to converge.
         self._node.get_logger().info("Running warmup teleports...")
-        for _ in range(3):
+
+        # Arm the multicopter physics plugin
+        enable_msg = Bool()
+        enable_msg.data = True
+        self._enable_pub.publish(enable_msg)
+
+        for i in range(3):
             self._teleport(2.0, 0.0, 1.5, math.pi)
-            time.sleep(0.5)
-            self._odom_event.clear()
-            self._odom_event.wait(timeout=1.0)
+            # Publish zero-velocity commands so the controller actively
+            # holds position during warmup (not just coasting/falling)
+            for _ in range(20):
+                self._publish_action(np.zeros(ACTION_DIM))
+                self._odom_event.clear()
+                self._odom_event.wait(timeout=0.05)
+            # Brief pause between warmup cycles
+            time.sleep(0.3)
 
         self._node.get_logger().info("DroneEnv initialized.")
 
@@ -193,10 +214,10 @@ class DroneEnv(gym.Env):
         derived = self._compute_derived(state)
 
         # Get success thresholds for this curriculum stage
-        vz_thresh, vxy_thresh = self._get_success_thresholds()
+        vz_thresh, vxy_thresh, d_xy_thresh, yaw_thresh = self._get_success_thresholds()
 
         # 6. Termination (uses raw velocity for accurate touchdown checks)
-        terminated, truncated, outcome, terminal_reward = check_termination(
+        terminated, truncated, outcome, terminal_reward, terminal_breakdown = check_termination(
             x=state["x"], y=state["y"], z=state["z"],
             roll=state["roll"], pitch=state["pitch"],
             vx=state["vx"], vy=state["vy"], vz=state["vz"],
@@ -205,7 +226,9 @@ class DroneEnv(gym.Env):
             yaw_error=derived["yaw_error"],
             step=self._step_count,
             success_vz_max=vz_thresh,
-            success_vxy_max=vxy_thresh
+            success_vxy_max=vxy_thresh,
+            success_d_xy_max=d_xy_thresh,
+            success_yaw_error_max=yaw_thresh,
         )
 
         # Debug: log full state on step-1 crashes to diagnose stale odom
@@ -255,20 +278,34 @@ class DroneEnv(gym.Env):
             "outcome": outcome,
             "terminal_reward": terminal_reward,
             **breakdown,
+            **terminal_breakdown,
         }
         if terminated or truncated:
             info["episode_outcome"] = outcome
             info["final_d_pad"] = derived["d_pad"]
             info["final_vz"] = state["vz"]
             info["final_vxy"] = math.hypot(state["vx"], state["vy"])
+            info["final_yaw_error"] = abs(derived["yaw_error"])
 
         return obs, reward, terminated, truncated, info
 
     # Altitude buffer added to teleport target.  After teleport, the
-    # X4 model falls briefly under gravity before the velocity controller
-    # engages.  The buffer ensures the drone settles near the spawn height
-    # rather than below PAD_ELEVATION.
-    _SPAWN_Z_BUFFER = 0  # m — tuning knob if needed
+    # drone freefalls until the MulticopterVelocityControl PID spools
+    # the motors and generates hover thrust.  With corrected drag
+    # (8e-06) the controller arrests the fall quickly.  0.35 m is enough
+    # for spool-up while keeping the drone close to target altitude so
+    # it doesn't have excessive height to descend through.
+    _SPAWN_Z_BUFFER = 0.35  # m — cushion for motor spool-up
+
+    # Stabilization thresholds — the reset loop waits until ALL of these
+    # are satisfied before starting the episode.
+    _SETTLE_VZ_MAX = 0.15       # m/s  vertical velocity
+    _SETTLE_VXY_MAX = 0.10      # m/s  horizontal velocity
+    _SETTLE_ROLL_MAX = math.radians(5)   # rad
+    _SETTLE_PITCH_MAX = math.radians(5)  # rad
+    _SETTLE_MIN_CLEARANCE = 0.10  # m — z_tof must exceed this
+    _SETTLE_TIMEOUT = 3.0       # seconds — hard limit to avoid hangs
+    _SETTLE_CHECK_HZ = 30       # how often to poll odom during settle
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -285,14 +322,24 @@ class DroneEnv(gym.Env):
 
         # 2. Stop the drone, then teleport (with built-in retry + verification)
         self._publish_action(np.zeros(ACTION_DIM))
-        teleport_z = spawn["z"] + self._SPAWN_Z_BUFFER
+        teleport_z = min(spawn["z"] + self._SPAWN_Z_BUFFER, Z_MAX - 0.10)
         self._teleport(spawn["x"], spawn["y"], teleport_z, spawn["yaw"])
 
         # 3. Publish takeoff (no-op in sim, primes the real Tello later)
         self._takeoff_pub.publish(Empty())
 
-        # 4. Extract settled state
-        state = self._extract_state()
+        # Arm Gazebo velocity controller
+        enable_msg = Bool()
+        enable_msg.data = True
+        self._enable_pub.publish(enable_msg)
+
+        # 4. Wait for the drone to stabilize after teleport.
+        #    With MulticopterMotorModel, the drone falls under gravity
+        #    until the PID controller spools the motors.  We must wait
+        #    for attitude and velocity to settle before starting the
+        #    episode, otherwise the agent sees a falling/tumbling drone
+        #    and learns that the pad is a death zone.
+        state = self._wait_for_stable_hover()
         """self._node.get_logger().info(
             f"  Settled: pos=({state['x']:.2f}, {state['y']:.2f}, {state['z']:.2f}) "
             f"rpy=({math.degrees(state['roll']):.1f}°, "
@@ -365,17 +412,108 @@ class DroneEnv(gym.Env):
         """Delegate to module-level pure function."""
         return compute_derived(state)
 
-    def _get_success_thresholds(self) -> tuple[float, float]:
-        """Get velocity thresholds for the current curriculum stage."""
+    def _get_success_thresholds(self) -> tuple[float, float, float, float]:
+        """Get per-stage success thresholds for the current curriculum stage."""
         stage_cfg = CURRICULUM_STAGES.get(self._spawner.stage, {})
         vz_max = stage_cfg.get("success_vz_max", SUCCESS_VZ_MAX)
         vxy_max = stage_cfg.get("success_vxy_max", SUCCESS_VXY_MAX)
-        return vz_max, vxy_max
+        d_xy_max = stage_cfg.get("success_d_xy_max", SUCCESS_D_XY_MAX)
+        yaw_max = stage_cfg.get("success_yaw_error_max", SUCCESS_YAW_ERROR_MAX)
+        return vz_max, vxy_max, d_xy_max, yaw_max
+
+    # ── Post-teleport stabilization ─────────────────────────────
+
+    def _wait_for_stable_hover(self) -> dict:
+        """Block until the drone is hovering stably with clearance.
+
+        After teleport the MulticopterVelocityControl PID needs time to
+        spool the motors and arrest the gravity-induced drop.  This method
+        polls odom at ~30 Hz and returns once vertical velocity, horizontal
+        velocity, roll, pitch, AND surface clearance are all within
+        thresholds — or after a hard timeout.
+
+        The clearance check is critical: a drone sitting on a surface also
+        has zero velocity and level attitude, so without it the settle loop
+        would exit immediately after the drone lands on the desk/ground
+        during the post-teleport fall.
+
+        Also publishes zero-velocity commands each iteration so the
+        velocity controller actively holds position rather than coasting.
+
+        Returns the final settled state dict.
+        """
+        deadline = time.monotonic() + self._SETTLE_TIMEOUT
+        poll_interval = 1.0 / self._SETTLE_CHECK_HZ
+        zero_action = np.zeros(ACTION_DIM)
+
+        settled_state = None
+        while time.monotonic() < deadline:
+            # Command the controller to hold position
+            self._publish_action(zero_action)
+
+            # Wait for fresh odom
+            self._odom_event.clear()
+            self._odom_event.wait(timeout=poll_interval)
+
+            state = self._extract_state()
+            vz = abs(state["vz"])
+            vxy = math.hypot(state["vx"], state["vy"])
+            roll_ok = abs(state["roll"]) < self._SETTLE_ROLL_MAX
+            pitch_ok = abs(state["pitch"]) < self._SETTLE_PITCH_MAX
+
+            # Compute clearance above nearest surface (same logic as
+            # compute_derived, inlined to avoid import cycle overhead).
+            x, y, z = state["x"], state["y"], state["z"]
+            if 0.0 <= x <= 0.60 and -0.50 <= y <= 0.50:
+                surface_below = PAD_ELEVATION
+            else:
+                surface_below = 0.0
+            clearance = z - surface_below
+
+            has_clearance = clearance > self._SETTLE_MIN_CLEARANCE
+
+            if (vz < self._SETTLE_VZ_MAX
+                    and vxy < self._SETTLE_VXY_MAX
+                    and roll_ok and pitch_ok
+                    and has_clearance):
+                settled_state = state
+                break
+
+        if settled_state is None:
+            # Timed out — use whatever state we have, log a warning
+            settled_state = self._extract_state()
+            x, y, z = settled_state["x"], settled_state["y"], settled_state["z"]
+            if 0.0 <= x <= 0.60 and -0.50 <= y <= 0.50:
+                sfc = PAD_ELEVATION
+            else:
+                sfc = 0.0
+            clr = z - sfc
+            self._node.get_logger().warn(
+                f"Settle timeout: vz={abs(settled_state['vz']):.3f} "
+                f"vxy={math.hypot(settled_state['vx'], settled_state['vy']):.3f} "
+                f"roll={math.degrees(settled_state['roll']):.1f}° "
+                f"pitch={math.degrees(settled_state['pitch']):.1f}° "
+                f"clearance={clr:.3f}m"
+            )
+
+        # One final odom flush to make sure we have the latest reading
+        for _ in range(2):
+            self._odom_event.clear()
+            self._odom_event.wait(timeout=0.05)
+        settled_state = self._extract_state()
+
+        return settled_state
 
     # ── Gazebo interface ─────────────────────────────────────────
 
     def _teleport(self, x: float, y: float, z: float, yaw: float):
-        """Move the drone via the persistent teleport helper."""
+        """Move the drone via the persistent teleport helper.
+
+        Flushes stale odom after the teleport so subsequent reads reflect
+        the new position.  The caller (reset or warmup) is responsible for
+        the full stabilization wait — this method only ensures the odom
+        pipeline has cleared the pre-teleport readings.
+        """
         w = math.cos(yaw / 2.0)
         qz = math.sin(yaw / 2.0)
 
@@ -385,20 +523,35 @@ class DroneEnv(gym.Env):
         # Read response (OK or FAIL — either way teleport worked)
         self._teleport_proc.stdout.readline()
 
-        # Flush stale odom
-        for _ in range(2):
+        # Flush stale odom — 3 cycles at 50 ms gives the odom publisher
+        # (30 Hz) at least one full cycle to emit a post-teleport reading.
+        for _ in range(3):
             self._odom_event.clear()
-            self._odom_event.wait(timeout=0.1)
+            self._odom_event.wait(timeout=0.05)
 
     def _publish_action(self, action: np.ndarray):
-        """Send velocity command to the drone."""
-        msg = Twist()
-        msg.linear.x = float(action[0])   # forward
-        msg.linear.y = float(action[1])   # left
-        msg.linear.z = float(action[2])   # up
-        msg.angular.z = float(action[3])  # yaw rate
-        self._cmd_pub.publish(msg)
+        enable_msg = Bool()
+        enable_msg.data = True
+        self._enable_pub.publish(enable_msg)
 
+        # MulticopterVelocityControl expects world-frame velocity.
+        # Action semantics are body-frame (matching real Tello SDK),
+        # so rotate linear x/y into world frame before publishing.
+        state = self._extract_state()
+        yaw = state["yaw"]
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+
+        vx_body = float(action[0])
+        vy_body = float(action[1])
+
+        msg = Twist()
+        msg.linear.x = vx_body * cos_yaw - vy_body * sin_yaw  # world frame
+        msg.linear.y = vx_body * sin_yaw + vy_body * cos_yaw  # world frame
+        msg.linear.z = float(action[2])   # z is frame-invariant
+        msg.angular.z = float(action[3])  # yaw rate is frame-invariant
+        self._cmd_pub.publish(msg)
+        
     # ── Math helpers (delegate to module-level functions) ────────
 
     @staticmethod

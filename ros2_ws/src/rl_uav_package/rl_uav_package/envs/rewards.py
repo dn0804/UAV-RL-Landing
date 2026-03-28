@@ -142,7 +142,6 @@ def compute_reward(
         "reward/jerk": r_jerk,
         "reward/time": r_time,
         "reward/total": reward,
-        # Diagnostic values (not reward components, but useful for debugging)
         "diag/d_pad": d_pad,
         "diag/h_above_marker": h_above_marker,
         "diag/centering_gate": centering_gate,
