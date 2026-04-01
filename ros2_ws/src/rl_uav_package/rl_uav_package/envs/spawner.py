@@ -22,6 +22,7 @@ from typing import Optional
 
 from rl_uav_package.config.constants import (
     MARKER_Z,
+    MARKER_HALF_WIDTH,
     CAMERA_HFOV_RAD,
     CAMERA_VFOV_RAD,
     CURRICULUM_STAGES,
@@ -120,13 +121,32 @@ class Spawner:
             f"Check stage configuration."
         )
 
-    def _marker_in_fov(self, drone_x: float, drone_y: float, drone_z: float) -> bool:
-        """Check whether the marker would be visible in the camera frame.
+    # Pre-computed tangent values for FOV checks.
+    _TAN_HALF_HFOV = math.tan(CAMERA_HFOV_RAD / 2.0)   # tan(41°) ≈ 0.8693
+    _TAN_HALF_VFOV = math.tan(CAMERA_VFOV_RAD / 2.0)    # tan(24.5°) ≈ 0.4557
 
-        At spawn the drone faces the marker, so the marker is horizontally
-        centered.  The only real FOV risk is vertical: if the drone is
-        much higher than the marker and close, the marker drops below the
-        camera's vertical field of view.
+    def _marker_in_fov(self, drone_x: float, drone_y: float, drone_z: float) -> bool:
+        """Check whether all four marker corners are within the camera FOV.
+
+        Uses the exact closed-form inequalities derived from projecting
+        each marker corner into the camera frame.  The critical quantity
+        is the optical depth to the marker's closest vertical edge:
+
+            min_depth = d - MARKER_HALF_WIDTH × |sin θ|
+
+        where d is horizontal distance and θ is approach angle.  The
+        corner at this depth is the geometric bottleneck for both
+        horizontal and vertical visibility.
+
+        The three constraints are:
+          1. Horizontal:  hw × cos θ  ≤  min_depth × tan(HFOV/2)
+          2. Upper z:     z  ≤  (marker_z - hw) + min_depth × tan(VFOV/2)
+          3. Lower z:     z  ≥  (marker_z + hw) - min_depth × tan(VFOV/2)
+
+        where hw = MARKER_HALF_WIDTH = 0.10 m.
+
+        A 90% margin is applied to avoid spawns where corners sit at
+        the very edge of the frame, which degrades solvePnP accuracy.
 
         Parameters
         ----------
@@ -137,46 +157,32 @@ class Spawner:
         -------
         visible : bool
         """
-        d_horizontal = math.hypot(drone_x, drone_y)
-
-        # Prevent division by zero when spawning extremely close to the wall
-        if d_horizontal < 0.01:
+        d = math.hypot(drone_x, drone_y)
+        if d < 0.01:
             return False
 
-        # Vertical angle from the drone's optical axis down to the marker.
-        # Positive means the marker is below the camera center.
-        height_above_marker = drone_z - MARKER_Z
-        vertical_angle = math.atan2(height_above_marker, d_horizontal)
+        hw = MARKER_HALF_WIDTH  # 0.10 m
+        theta = math.atan2(drone_y, drone_x)
 
-        # The camera's vertical FOV extends ±VFOV/2 from the optical axis.
-        # The marker must be within this range.  We use a small margin (90%
-        # of the half-FOV) to avoid spawns where the marker sits right at
-        # the frame edge, which degrades solvePnP accuracy.
-        vfov_margin = 0.90
-        if abs(vertical_angle) > (CAMERA_VFOV_RAD / 2.0) * vfov_margin:
+        # Optical depth to the closest vertical edge of the marker
+        min_depth = d - hw * abs(math.sin(theta))
+        if min_depth <= 0.0:
             return False
 
-        # Horizontal check: the marker should be roughly centered since the
-        # drone faces it.  This is a safety net — at spawn, yaw is computed
-        # to aim at the marker, so horizontal offset should be near zero.
-        # But verify the approach angle doesn't push the marker outside the
-        # horizontal FOV (can happen at extreme angles if the marker is at
-        # the wall and the drone's FOV clips the wall at a glancing angle).
-        hfov_margin = 0.90
-        horizontal_angle = abs(math.atan2(abs(drone_y), drone_x))
-        # This is the angle of the marker relative to the drone's heading.
-        # Since the drone points at (0, 0), the marker is on the optical axis.
-        # The actual horizontal offset in the camera frame is near zero.
-        # The meaningful check: can the camera *physically see* the wall plane
-        # at the marker location?  At steep approach angles, the wall is
-        # nearly parallel to the line of sight, but the marker itself is
-        # what we're detecting, not the wall, so this rarely fails.
-        # We include it for completeness.
-        bearing_to_marker = math.atan2(0.0 - drone_y, 0.0 - drone_x)
-        yaw = bearing_to_marker  # drone heading at spawn
-        # Angle from camera center to marker in the horizontal plane
-        h_offset = abs(bearing_to_marker - yaw)  # always 0 by construction
-        if h_offset > (CAMERA_HFOV_RAD / 2.0) * hfov_margin:
+        margin = 0.90  # 90% of FOV to avoid edge degradation
+
+        # 1. Horizontal: all four corners within horizontal FOV
+        if hw * abs(math.cos(theta)) > min_depth * self._TAN_HALF_HFOV * margin:
+            return False
+
+        # 2. Upper altitude limit: bottom corners don't drop below frame
+        z_max = (MARKER_Z - hw) + min_depth * self._TAN_HALF_VFOV * margin
+        if drone_z > z_max:
+            return False
+
+        # 3. Lower altitude limit: top corners don't push above frame
+        z_min = (MARKER_Z + hw) - min_depth * self._TAN_HALF_VFOV * margin
+        if drone_z < z_min:
             return False
 
         return True

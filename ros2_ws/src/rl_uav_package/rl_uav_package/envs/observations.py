@@ -1,22 +1,26 @@
 """
 Observation vector assembly.
 
-Builds the 29-dimensional normalized observation from raw sensor data.
-Owns the action history ring buffer and applies ToF cosine correction.
+Builds the 33-dimensional normalized observation from raw sensor data.
+Owns the action history ring buffer.
 The EMA velocity filter is external — drone_env calls it before passing
 filtered velocities here.
 
-Channel layout (29 total):
-    [0]     x               forward distance to marker (vision or odom)
-    [1]     y               lateral offset
-    [2]     z               vertical offset
-    [3]     yaw             heading relative to marker
+Channel layout (33 total):
+    [0]     x               forward distance to marker (vision, body frame)
+    [1]     y               lateral offset (vision, body frame)
+    [2]     z               vertical offset (vision, body frame)
+    [3]     yaw             heading relative to marker (odom-derived)
     [4]     vx              forward velocity (EMA-filtered)
     [5]     vy              lateral velocity (EMA-filtered)
     [6]     vz              vertical velocity (EMA-filtered)
-    [7]     z_tof           cosine-corrected ToF range
+    [7]     z_tof           true vertical clearance to surface below
     [8]     dropout_timer   steps since last marker detection
-    [9..28] action history  5 most recent actions × 4 axes, newest first
+    [9]     roll            body roll angle (IMU)
+    [10]    pitch           body pitch angle (IMU)
+    [11]    marker_px       marker pixel x in frame, normalized [-1, 1]
+    [12]    marker_py       marker pixel y in frame, normalized [-1, 1]
+    [13..32] action history 5 most recent actions × 4 axes, newest first
 """
 
 import math
@@ -64,11 +68,6 @@ class ObservationBuilder:
         Call this once per step, *before* ``build()``, so the observation
         the agent receives includes the action it just took as the most
         recent entry in the history.
-
-        Parameters
-        ----------
-        action : array-like, shape (4,)
-            The action sent to the drone this step, in [-1, 1].
         """
         self._action_history.append(np.asarray(action, dtype=np.float32).copy())
 
@@ -85,59 +84,47 @@ class ObservationBuilder:
         roll: float,
         pitch: float,
         dropout_timer: int,
+        marker_px: float = 0.0,
+        marker_py: float = 0.0,
     ) -> np.ndarray:
         """Assemble, normalize, and clip the full observation vector.
 
         Parameters
         ----------
-        x, y, z : float
-            Position relative to marker (m).  Source is vision when
-            available, odom ground truth for the baseline.
-        yaw : float
-            Heading relative to marker (rad).
-        vx, vy, vz : float
-            Velocity (m/s), already passed through the EMA filter.
-        z_tof_raw : float
-            Raw ToF range reading (m), *before* cosine correction.
-        roll, pitch : float
-            Drone attitude (rad), from IMU.  Used for ToF correction.
-        dropout_timer : int
-            Steps since the marker was last detected.  Zero when visible.
-
-        Returns
-        -------
-        obs : np.ndarray, shape (29,), dtype float32
-            Normalized and clipped observation vector.
+        marker_px, marker_py : float
+            Marker center position in camera frame, normalized so that
+            (0, 0) = frame center, (-1, -1) = top-left, (1, 1) = bottom-right.
+            Frozen at last-known values during marker dropout.
         """
-        # 1. Cosine-correct the ToF range
-        z_tof = z_tof_raw * math.cos(pitch) * math.cos(roll)
 
-        # 2. Cap the dropout timer
+        # 1. Cap the dropout timer
         dropout_capped = min(dropout_timer, DROPOUT_TIMER_CAP)
 
-        # 3. Assemble the 9 sensor channels
+        # 2. Assemble the 13 sensor channels
         sensor = np.array([
             x, y, z, yaw,
             vx, vy, vz,
-            z_tof,
+            z_tof_raw,
             float(dropout_capped),
+            roll,
+            pitch,
+            marker_px,
+            marker_py,
         ], dtype=np.float32)
 
-        # 4. Flatten action history (newest first)
-        #    deque order: oldest at [0], newest at [-1]
-        #    We want newest first in the obs, so reverse.
+        # 3. Flatten action history (newest first)
         history_flat = np.concatenate(
             [self._action_history[i] for i in range(len(self._action_history) - 1, -1, -1)]
         )
 
-        # 5. Concatenate into the full vector
+        # 4. Concatenate into the full vector
         obs_raw = np.concatenate([sensor, history_flat])
 
         assert obs_raw.shape == (OBS_DIM,), (
             f"Observation has {obs_raw.shape[0]} elements, expected {OBS_DIM}"
         )
 
-        # 6. Normalize and clip
+        # 5. Normalize and clip
         obs_normalized = obs_raw / OBS_SCALE
         obs_clipped = np.clip(obs_normalized, -OBS_CLIP, OBS_CLIP)
 

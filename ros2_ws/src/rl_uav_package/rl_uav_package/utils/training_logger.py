@@ -45,6 +45,11 @@ REWARD_KEYS = [
     "reward/horizontal",
     "reward/descent",
     "reward/yaw",
+    "reward/centering",
+    "reward/vel_xy",
+    "reward/vel_z",
+    "reward/vel_xy_uni",
+    "reward/velocity",
     "reward/jerk",
     "reward/time",
     "reward/total",
@@ -52,9 +57,20 @@ REWARD_KEYS = [
 
 # Diagnostic keys from rewards.py
 DIAG_KEYS = [
-    "diag/centering_gate",
-    "diag/gate_blend",
     "diag/delta_z",
+    "diag/pixel_dist",
+    "diag/v_xy",
+    "diag/proximity",
+]
+
+# Terminal breakdown keys from termination.py (present only on final step)
+TERMINAL_KEYS = [
+    "terminal/vz_bonus",
+    "terminal/vxy_bonus",
+    "terminal/miss_pos",
+    "terminal/miss_vxy",
+    "terminal/miss_vz",
+    "terminal/miss_avg",
 ]
 
 
@@ -171,6 +187,11 @@ class TrainingLogger(BaseCallback):
             self.logger.record("episode/final_vz", info["final_vz"])
         if "final_vxy" in info:
             self.logger.record("episode/final_vxy", info["final_vxy"])
+
+        # ── Terminal reward breakdown (bonuses / miss factors) ─
+        for key in TERMINAL_KEYS:
+            if key in info:
+                self.logger.record(key, info[key])
 
         # ── Per-episode reward breakdown ─────────────────────
         if self._episode_count % self._log_reward_freq == 0:

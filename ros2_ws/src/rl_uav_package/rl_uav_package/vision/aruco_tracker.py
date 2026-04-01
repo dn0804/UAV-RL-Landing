@@ -90,28 +90,40 @@ class DropoutState:
         Frozen z position (body frame).
     last_yaw : float
         Frozen yaw from last detection.
+    last_px : float
+        Frozen marker pixel x in frame, normalized [-1, 1].
+    last_py : float
+        Frozen marker pixel y in frame, normalized [-1, 1].
     """
     timer: int = 0
     last_x: float = 0.0
     last_y: float = 0.0
     last_z: float = 0.0
     last_yaw: float = 0.0
+    last_px: float = 0.0
+    last_py: float = 0.0
 
-    def reset(self, x: float, y: float, z: float, yaw: float) -> None:
+    def reset(self, x: float, y: float, z: float, yaw: float,
+              px: float = 0.0, py: float = 0.0) -> None:
         """Initialize with a known pose at episode start."""
         self.timer = 0
         self.last_x = x
         self.last_y = y
         self.last_z = z
         self.last_yaw = yaw
+        self.last_px = px
+        self.last_py = py
 
-    def on_detection(self, x: float, y: float, z: float, yaw: float) -> None:
+    def on_detection(self, x: float, y: float, z: float, yaw: float,
+                     px: float = 0.0, py: float = 0.0) -> None:
         """Marker was detected — update stored pose, reset timer."""
         self.timer = 0
         self.last_x = x
         self.last_y = y
         self.last_z = z
         self.last_yaw = yaw
+        self.last_px = px
+        self.last_py = py
 
     def on_miss(self) -> None:
         """Marker was NOT detected — increment timer, pose stays frozen."""
@@ -121,15 +133,17 @@ class DropoutState:
     def is_visible(self) -> bool:
         return self.timer == 0
 
-    def get_pose(self) -> tuple[float, float, float, float]:
-        """Return the current (possibly frozen) pose + timer value.
+    def get_pose(self) -> tuple[float, float, float, float, float, float]:
+        """Return the current (possibly frozen) pose and pixel coords.
 
         Returns
         -------
-        x, y, z, yaw : float
-            Position and heading.  Live if visible, frozen if in dropout.
+        x, y, z, yaw, px, py : float
+            Position, heading, and normalized pixel coords.
+            Live if visible, frozen if in dropout.
         """
-        return self.last_x, self.last_y, self.last_z, self.last_yaw
+        return (self.last_x, self.last_y, self.last_z,
+                self.last_yaw, self.last_px, self.last_py)
 
 
 # ── Teleport detection (anti-flip guard) ────────────────────────────
@@ -179,11 +193,14 @@ class CameraIntrinsics:
         Principal point (image center) in pixels.
     dist_coeffs : np.ndarray, shape (5,) or (4,)
         Distortion coefficients.  For the sim camera, these are all zero.
+
+    Defaults match the Gazebo sim camera: 960×720 at 82° (1.43117 rad) HFOV.
+    fx = width / (2 × tan(hfov / 2)) ≈ 552.28.
     """
-    fx: float = 554.25
-    fy: float = 554.25
-    cx: float = 320.0
-    cy: float = 240.0
+    fx: float = 552.28
+    fy: float = 552.28
+    cx: float = 480.0
+    cy: float = 360.0
     dist_coeffs: np.ndarray = field(
         default_factory=lambda: np.zeros(5, dtype=np.float64)
     )
@@ -204,7 +221,7 @@ def detect_marker(
     intrinsics: CameraIntrinsics,
     marker_id: Optional[int] = None,
     dictionary_name: str = "DICT_5X5_250",
-) -> Optional[tuple[np.ndarray, np.ndarray]]:
+) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """Detect an ArUco marker and estimate its 3D pose.
 
     Parameters
@@ -218,12 +235,14 @@ def detect_marker(
     marker_id : int, optional
         If given, only accept detections matching this ID.
     dictionary_name : str
-        ArUco dictionary name (e.g. "DICT_5X5_250").
+        ArUco dictionary name (e.g. "DICT_4X4_50").
 
     Returns
     -------
-    (tvec, rvec) : tuple of np.ndarray, each shape (3,)
-        Translation and rotation vectors in the OpenCV camera frame.
+    (tvec, rvec, pixel_center) : tuple
+        tvec : np.ndarray, shape (3,) — translation in OpenCV camera frame.
+        rvec : np.ndarray, shape (3,) — rotation (Rodrigues) in camera frame.
+        pixel_center : np.ndarray, shape (2,) — marker center in pixels (x, y).
         Returns None if no valid detection was found.
     """
     if not _CV2_AVAILABLE:
@@ -250,6 +269,9 @@ def detect_marker(
     else:
         idx = 0
 
+    # Pixel center of the detected marker (mean of 4 corners)
+    pixel_center = corners[idx].reshape(4, 2).mean(axis=0)
+
     # Define the 3D marker corners (centered at origin, in marker frame)
     half = marker_size / 2.0
     obj_points = np.array([
@@ -272,4 +294,4 @@ def detect_marker(
     if not success:
         return None
 
-    return tvec.ravel(), rvec.ravel()
+    return tvec.ravel(), rvec.ravel(), pixel_center
