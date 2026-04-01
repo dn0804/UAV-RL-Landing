@@ -13,7 +13,7 @@ from rl_uav_package.config.constants import (
     X_MIN, X_MAX, Y_MIN, Y_MAX, Z_MAX,
     PAD_ELEVATION, LANDING_PAD_FORWARD_OFFSET,
     TOF_CONTACT_THRESHOLD,
-    SUCCESS_D_XY_MAX, SUCCESS_VZ_MAX, SUCCESS_VXY_MAX, SUCCESS_YAW_ERROR_MAX,
+    SUCCESS_D_XY_MAX, SUCCESS_VZ_MAX, SUCCESS_VXY_MAX,
     CRASH_ROLL_MAX, CRASH_PITCH_MAX,
     MAX_STEPS,
     R_SUCCESS, R_CRASH, R_TIMEOUT,
@@ -47,12 +47,10 @@ def check_termination(
     vz: float,
     z_tof: float,  # (Passed in but no longer used for physical collision)
     d_pad: float,
-    yaw_error: float,
     step: int,
     success_vz_max: float = SUCCESS_VZ_MAX,
     success_vxy_max: float = SUCCESS_VXY_MAX,
     success_d_xy_max: float = SUCCESS_D_XY_MAX,
-    success_yaw_error_max: float = SUCCESS_YAW_ERROR_MAX,
 ) -> tuple[bool, bool, str, float, dict]:
     """Evaluate all episode-ending conditions.
 
@@ -97,15 +95,14 @@ def check_termination(
             d_pad < success_d_xy_max
             and abs(vz) < success_vz_max
             and v_xy < success_vxy_max
-            and abs(yaw_error) < success_yaw_error_max
         )
 
         if success:
-            # Soft-landing bonus: up to 10 pts each for landing with
+            # Soft-landing bonus: up to 2 pts each for landing with
             # velocity well below the curriculum threshold.
-            # 0 velocity → full 10 pts; threshold velocity → 0 pts.
-            vz_bonus  = 30.0 * (1.0 - abs(vz) / success_vz_max)
-            vxy_bonus = 30.0 * (1.0 - v_xy / success_vxy_max)
+            # 0 velocity → full 2 pts; threshold velocity → 0 pts.
+            vz_bonus  = 2.0 * (1.0 - abs(vz) / success_vz_max)
+            vxy_bonus = 2.0 * (1.0 - v_xy / success_vxy_max)
             terminal_breakdown = {
                 "terminal/vz_bonus": vz_bonus,
                 "terminal/vxy_bonus": vxy_bonus,
@@ -118,21 +115,18 @@ def check_termination(
             pos_miss = min(d_pad / success_d_xy_max, 1.0)
             vxy_miss = min(v_xy / success_vxy_max, 1.0)
             vz_miss = min(abs(vz) / success_vz_max, 1.0)
-            yaw_miss = min(abs(yaw_error) / success_yaw_error_max, 1.0)
 
             # Average of all miss factors — 0.0 = nearly perfect, 1.0 = way off
-            miss = (pos_miss + vxy_miss + vz_miss + yaw_miss) / 4.0
+            miss = (pos_miss + vxy_miss + vz_miss) / 3.0
 
-            # Base penalty is R_CRASH (-100). Near miss stays near -75.
-            # Bad miss reaches -150.  Crashing is always worse than
-            # timing out (R_TIMEOUT = -50).
-            graduated_penalty = (0.75 * R_CRASH) - (75.0 * miss)
+            # Near miss = −20, total miss = −35.  Crashing is always worse
+            # than timing out (R_TIMEOUT = −12, max timeout total ≈ −21).
+            graduated_penalty = -20.0 - 15.0 * miss
 
             terminal_breakdown = {
                 "terminal/miss_pos": pos_miss,
                 "terminal/miss_vxy": vxy_miss,
                 "terminal/miss_vz": vz_miss,
-                "terminal/miss_yaw": yaw_miss,
                 "terminal/miss_avg": miss,
             }
             return True, False, OUTCOME_CRASH_CONTACT, graduated_penalty, terminal_breakdown

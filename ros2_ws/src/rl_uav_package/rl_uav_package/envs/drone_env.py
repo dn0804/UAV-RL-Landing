@@ -7,14 +7,14 @@ delegated to specialist modules:
 
     rewards.py        -> per-step shaping reward
     termination.py    -> episode-ending conditions
-    observations.py   -> 29-dim normalized vector assembly
+    observations.py   -> 31-dim normalized vector assembly
     spawner.py        -> rejection-sampled spawn positions
     ema.py            -> velocity smoothing
-    aruco_tracker.py  -> dropout state (vision integration later)
+    aruco_tracker.py  -> ArUco detection, coordinate transforms, dropout state
 
-For the baseline (no domain randomization, no live vision), position comes
-from odom ground truth and z_tof is approximated as drone altitude above
-the ground plane.
+Position observations come from the vision pipeline (ArUco solvePnP →
+body-frame transform).  Rewards and termination use world-frame odom
+ground truth (no sim-to-real concern — rewards aren't computed on hardware).
 """
 
 import math
@@ -23,6 +23,7 @@ import threading
 import time
 import os
 
+import cv2
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
@@ -31,6 +32,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Image as RosImage
 from std_msgs.msg import Empty, Bool
 
 from rl_uav_package.config.constants import (
@@ -41,15 +43,19 @@ from rl_uav_package.config.constants import (
     GZ_WORLD_NAME, GZ_DRONE_MODEL_NAME,
     PAD_ELEVATION, CURRICULUM_STAGES,
     SUCCESS_VZ_MAX, SUCCESS_VXY_MAX,
-    SUCCESS_D_XY_MAX, SUCCESS_YAW_ERROR_MAX,
+    SUCCESS_D_XY_MAX,
     Z_MAX,
+    MARKER_SIZE, MARKER_ID, MARKER_DICTIONARY,
+    SIM_CAMERA_FX, SIM_CAMERA_FY, SIM_CAMERA_CX, SIM_CAMERA_CY,
 )
 from rl_uav_package.envs.rewards import compute_reward
 from rl_uav_package.envs.termination import check_termination
 from rl_uav_package.envs.observations import ObservationBuilder
 from rl_uav_package.envs.spawner import Spawner
 from rl_uav_package.filters.ema import EMAFilter
-from rl_uav_package.vision.aruco_tracker import DropoutState
+from rl_uav_package.vision.aruco_tracker import (
+    DropoutState, CameraIntrinsics, detect_marker, camera_to_body, is_teleport,
+)
 
 
 class DroneEnv(gym.Env):
@@ -115,6 +121,20 @@ class DroneEnv(gym.Env):
         # Odom synchronization
         self._latest_odom = None
         self._odom_event = threading.Event()
+
+        # Camera subscription (30 Hz from Gazebo)
+        self._latest_image = None
+        self._image_event = threading.Event()
+        self._cam_sub = self._node.create_subscription(
+            RosImage, "/camera/image_raw", self._image_cb, qos,
+        )
+
+        # ── Vision pipeline ───────────────────────────────────────
+        self._intrinsics = CameraIntrinsics(
+            fx=SIM_CAMERA_FX, fy=SIM_CAMERA_FY,
+            cx=SIM_CAMERA_CX, cy=SIM_CAMERA_CY,
+        )
+        self._marker_prev_pos = None  # for teleport/flip rejection
 
         # Spin ROS 2 in background
         self._spin_thread = threading.Thread(target=self._spin, daemon=True)
@@ -187,6 +207,112 @@ class DroneEnv(gym.Env):
         self._latest_odom = msg
         self._odom_event.set()
 
+    def _image_cb(self, msg: RosImage):
+        self._latest_image = msg
+        self._image_event.set()
+
+    # ── Vision pipeline ──────────────────────────────────────────
+
+    def _process_vision(self) -> tuple[float, float, float, float, float]:
+        """Run ArUco detection on the latest camera frame.
+
+        Updates DropoutState internally.  Returns body-frame (x, y, z)
+        relative to the marker and normalized pixel coordinates (px, py)
+        — live if detected, frozen if in dropout.
+        """
+        img_msg = self._latest_image
+        if img_msg is None:
+            self._dropout.on_miss()
+            x, y, z, _, px, py = self._dropout.get_pose()
+            return x, y, z, px, py
+
+        # Convert ROS Image (RGB8 from Gazebo) → grayscale for ArUco
+        img = np.frombuffer(img_msg.data, dtype=np.uint8).reshape(
+            img_msg.height, img_msg.width, 3
+        )
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+        # Detect marker
+        result = detect_marker(
+            image=gray,
+            marker_size=MARKER_SIZE,
+            intrinsics=self._intrinsics,
+            marker_id=MARKER_ID,
+            dictionary_name=MARKER_DICTIONARY,
+        )
+
+        if result is None:
+            self._dropout.on_miss()
+            x, y, z, _, px, py = self._dropout.get_pose()
+            return x, y, z, px, py
+
+        tvec, rvec, pixel_center = result
+        body_pos = camera_to_body(tvec)
+
+        # Anti-flip: reject detections implying impossible motion
+        if self._marker_prev_pos is not None:
+            if is_teleport(self._marker_prev_pos, body_pos):
+                self._dropout.on_miss()
+                x, y, z, _, px, py = self._dropout.get_pose()
+                return x, y, z, px, py
+
+        # Normalize pixel coordinates: (0,0) = frame center, ±1 = frame edge
+        px = (pixel_center[0] - SIM_CAMERA_CX) / SIM_CAMERA_CX
+        py = (pixel_center[1] - SIM_CAMERA_CY) / SIM_CAMERA_CY
+
+        # Valid detection — update state
+        self._marker_prev_pos = body_pos.copy()
+        self._dropout.on_detection(
+            x=float(body_pos[0]),
+            y=float(body_pos[1]),
+            z=float(body_pos[2]),
+            yaw=0.0,  # yaw comes from odom, not vision
+            px=float(px),
+            py=float(py),
+        )
+
+        return float(body_pos[0]), float(body_pos[1]), float(body_pos[2]), float(px), float(py)
+
+    def _detect_first_frame(self) -> tuple[np.ndarray, float, float] | None:
+        """Wait for a camera frame and attempt marker detection.
+
+        Used during reset() for first-frame marker validation (§9).
+        Tries up to 5 frames to account for rendering lag.
+
+        Returns
+        -------
+        (body_pos, px, py) or None
+            body_pos : np.ndarray shape (3,) — body-frame [x, y, z].
+            px, py : float — normalized pixel coords [-1, 1].
+        """
+        for _ in range(5):
+            self._image_event.clear()
+            self._image_event.wait(timeout=0.2)
+
+            img_msg = self._latest_image
+            if img_msg is None:
+                continue
+
+            img = np.frombuffer(img_msg.data, dtype=np.uint8).reshape(
+                img_msg.height, img_msg.width, 3
+            )
+            gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+            result = detect_marker(
+                image=gray,
+                marker_size=MARKER_SIZE,
+                intrinsics=self._intrinsics,
+                marker_id=MARKER_ID,
+                dictionary_name=MARKER_DICTIONARY,
+            )
+            if result is not None:
+                tvec, _, pixel_center = result
+                px = (pixel_center[0] - SIM_CAMERA_CX) / SIM_CAMERA_CX
+                py = (pixel_center[1] - SIM_CAMERA_CY) / SIM_CAMERA_CY
+                return camera_to_body(tvec), float(px), float(py)
+
+        return None
+
     # ── Gymnasium API ────────────────────────────────────────────
 
     def step(self, action: np.ndarray):
@@ -214,7 +340,7 @@ class DroneEnv(gym.Env):
         derived = self._compute_derived(state)
 
         # Get success thresholds for this curriculum stage
-        vz_thresh, vxy_thresh, d_xy_thresh, yaw_thresh = self._get_success_thresholds()
+        vz_thresh, vxy_thresh, d_xy_thresh = self._get_success_thresholds()
 
         # 6. Termination (uses raw velocity for accurate touchdown checks)
         terminated, truncated, outcome, terminal_reward, terminal_breakdown = check_termination(
@@ -223,12 +349,10 @@ class DroneEnv(gym.Env):
             vx=state["vx"], vy=state["vy"], vz=state["vz"],
             z_tof=derived["z_tof"],
             d_pad=derived["d_pad"],
-            yaw_error=derived["yaw_error"],
             step=self._step_count,
             success_vz_max=vz_thresh,
             success_vxy_max=vxy_thresh,
             success_d_xy_max=d_xy_thresh,
-            success_yaw_error_max=yaw_thresh,
         )
 
         # Debug: log full state on step-1 crashes to diagnose stale odom
@@ -243,37 +367,60 @@ class DroneEnv(gym.Env):
                 f"z_tof={derived['z_tof']:.3f}"
             )
 
-        # 7. Shaping reward (uses delta trackers)
+        # 7. Vision pipeline — get body-frame position + pixel coords
+        vis_x, vis_y, vis_z, vis_px, vis_py = self._process_vision()
+
+        # 8. Shaping reward (uses delta trackers + pixel centering)
         shaping_reward, breakdown = compute_reward(
             d_pad=derived["d_pad"],
             d_pad_prev=self._d_pad_prev,
             z=state["z"],
             z_prev=self._z_prev,
-            h_above_marker=derived["h_above_marker"],
             yaw_error=derived["yaw_error"],
             d_marker=derived["d_marker"],
+            marker_px=vis_px,
+            marker_py=vis_py,
+            vx=state["vx"],
+            vy=state["vy"],
+            vz=state["vz"],
             action=action,
             prev_action=prev_action,
         )
 
         reward = shaping_reward + terminal_reward
 
-        # 8. Build observation (uses filtered velocity)
+        # 9. Build observation (vision position + pixel coords, odom yaw/velocity/attitude)
         obs = self._obs_builder.build(
-            x=state["x"], y=state["y"], z=state["z"],
-            yaw=state["yaw"],
+            x=vis_x, y=vis_y, z=vis_z,
+            yaw=derived["yaw_error"],
             vx=vel_filtered[0], vy=vel_filtered[1], vz=vel_filtered[2],
             z_tof_raw=derived["z_tof_raw"],
             roll=state["roll"], pitch=state["pitch"],
             dropout_timer=self._dropout.timer,
+            marker_px=vis_px,
+            marker_py=vis_py,
         )
 
-        # 9. Update trackers for next step
+        # Guard: NaN in observations or reward crashes training.
+        # Sources: Gazebo physics glitches, solvePnP edge cases, odom
+        # corruption.  Replace with safe values rather than crashing.
+        if np.isnan(obs).any():
+            self._node.get_logger().warn(
+                f"NaN in observation at step {self._step_count}, replacing with zeros"
+            )
+            obs = np.nan_to_num(obs, nan=0.0)
+        if math.isnan(reward):
+            self._node.get_logger().warn(
+                f"NaN reward at step {self._step_count}, replacing with 0"
+            )
+            reward = 0.0
+
+        # 10. Update trackers for next step
         self._d_pad_prev = derived["d_pad"]
         self._z_prev = state["z"]
         self._prev_action = action.copy()
 
-        # 10. Info dict for logging callback
+        # 11. Info dict for logging callback
         info = {
             "outcome": outcome,
             "terminal_reward": terminal_reward,
@@ -285,17 +432,8 @@ class DroneEnv(gym.Env):
             info["final_d_pad"] = derived["d_pad"]
             info["final_vz"] = state["vz"]
             info["final_vxy"] = math.hypot(state["vx"], state["vy"])
-            info["final_yaw_error"] = abs(derived["yaw_error"])
 
         return obs, reward, terminated, truncated, info
-
-    # Altitude buffer added to teleport target.  After teleport, the
-    # drone freefalls until the MulticopterVelocityControl PID spools
-    # the motors and generates hover thrust.  With corrected drag
-    # (8e-06) the controller arrests the fall quickly.  0.35 m is enough
-    # for spool-up while keeping the drone close to target altitude so
-    # it doesn't have excessive height to descend through.
-    _SPAWN_Z_BUFFER = 0.35  # m — cushion for motor spool-up
 
     # Stabilization thresholds — the reset loop waits until ALL of these
     # are satisfied before starting the episode.
@@ -303,73 +441,112 @@ class DroneEnv(gym.Env):
     _SETTLE_VXY_MAX = 0.10      # m/s  horizontal velocity
     _SETTLE_ROLL_MAX = math.radians(5)   # rad
     _SETTLE_PITCH_MAX = math.radians(5)  # rad
-    _SETTLE_MIN_CLEARANCE = 0.10  # m — z_tof must exceed this
+    _SETTLE_MIN_CLEARANCE = 0.05  # m — reduced from 0.10 for new marker
+                                  #     geometry where spawns near marker_z
+                                  #     (0.878) are only ~0.128m above desk
     _SETTLE_TIMEOUT = 3.0       # seconds — hard limit to avoid hangs
     _SETTLE_CHECK_HZ = 30       # how often to poll odom during settle
+
+    # Maximum respawn attempts for first-frame marker validation (§9).
+    _MAX_RESPAWN_ATTEMPTS = 10
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self._step_count = 0
         self._prev_action = np.zeros(ACTION_DIM, dtype=np.float32)
 
-        # 1. Sample spawn position
-        spawn = self._spawner.sample()
+        # ── Spawn + stabilize + first-frame marker validation ─────
+        # The marker must be detected in the first frame after each
+        # reset.  If detection fails, the spawn is discarded and a new
+        # one is sampled.  This prevents invalid episodes (agent starts
+        # with no visual lock) from polluting the rollout buffer.
+        body_pos = None
+        initial_px = 0.0
+        initial_py = 0.0
+        state = None
 
-        """self._node.get_logger().info(
-            f"RESET: x={spawn['x']:.2f} y={spawn['y']:.2f} "
-            f"z={spawn['z']:.2f} yaw={math.degrees(spawn['yaw']):.1f}°"
-        )"""
+        for attempt in range(self._MAX_RESPAWN_ATTEMPTS):
+            # 1. Sample spawn position
+            spawn = self._spawner.sample()
 
-        # 2. Stop the drone, then teleport (with built-in retry + verification)
-        self._publish_action(np.zeros(ACTION_DIM))
-        teleport_z = min(spawn["z"] + self._SPAWN_Z_BUFFER, Z_MAX - 0.10)
-        self._teleport(spawn["x"], spawn["y"], teleport_z, spawn["yaw"])
+            # 2. Stop the drone, then teleport directly to spawn_z
+            self._publish_action(np.zeros(ACTION_DIM))
+            self._teleport(spawn["x"], spawn["y"], spawn["z"], spawn["yaw"])
 
-        # 3. Publish takeoff (no-op in sim, primes the real Tello later)
-        self._takeoff_pub.publish(Empty())
+            # 3. Arm Gazebo velocity controller
+            self._takeoff_pub.publish(Empty())
+            enable_msg = Bool()
+            enable_msg.data = True
+            self._enable_pub.publish(enable_msg)
 
-        # Arm Gazebo velocity controller
-        enable_msg = Bool()
-        enable_msg.data = True
-        self._enable_pub.publish(enable_msg)
+            # 4. Wait for the drone to stabilize after teleport
+            state = self._wait_for_stable_hover()
 
-        # 4. Wait for the drone to stabilize after teleport.
-        #    With MulticopterMotorModel, the drone falls under gravity
-        #    until the PID controller spools the motors.  We must wait
-        #    for attitude and velocity to settle before starting the
-        #    episode, otherwise the agent sees a falling/tumbling drone
-        #    and learns that the pad is a death zone.
-        state = self._wait_for_stable_hover()
-        """self._node.get_logger().info(
-            f"  Settled: pos=({state['x']:.2f}, {state['y']:.2f}, {state['z']:.2f}) "
-            f"rpy=({math.degrees(state['roll']):.1f}°, "
-            f"{math.degrees(state['pitch']):.1f}°, "
-            f"{math.degrees(state['yaw']):.1f}°)"
-        )"""
+            # 5. First-frame marker validation
+            detection = self._detect_first_frame()
+            if detection is not None:
+                body_pos, initial_px, initial_py = detection
+                break
 
-        # 5. Reset sub-modules
+            self._node.get_logger().warn(
+                f"First-frame marker validation failed "
+                f"(attempt {attempt + 1}/{self._MAX_RESPAWN_ATTEMPTS}), "
+                f"resampling spawn"
+            )
+
+        if body_pos is None:
+            # Emergency fallback — should be extremely rare with correct
+            # spawn validation.  Use an approximate body-frame position
+            # derived from odom so the episode can proceed.
+            self._node.get_logger().error(
+                "Marker not detected after all respawn attempts; "
+                "using odom-derived fallback"
+            )
+            body_pos = np.array([
+                state["x"],
+                state["y"],
+                state["z"] - MARKER_Z,
+            ])
+            initial_px = 0.0
+            initial_py = 0.0
+
+        # ── Reset sub-modules with vision pose ────────────────────
+        self._marker_prev_pos = body_pos.copy()
         vel_initial = np.array([state["vx"], state["vy"], state["vz"]])
         self._ema.reset(vel_initial)
         self._obs_builder.reset()
         self._dropout.reset(
-            x=state["x"], y=state["y"], z=state["z"], yaw=state["yaw"],
+            x=float(body_pos[0]),
+            y=float(body_pos[1]),
+            z=float(body_pos[2]),
+            yaw=0.0,
+            px=initial_px,
+            py=initial_py,
         )
 
-        # 6. Initialize delta trackers with actual settled values.
+        # ── Initialize delta trackers (odom-based, for rewards) ───
         derived = self._compute_derived(state)
         self._d_pad_prev = derived["d_pad"]
         self._z_prev = state["z"]
 
-        # 7. Build initial observation
+        # ── Build initial observation with vision position ────────
         vel_filtered = self._ema.value
         obs = self._obs_builder.build(
-            x=state["x"], y=state["y"], z=state["z"],
-            yaw=state["yaw"],
+            x=float(body_pos[0]),
+            y=float(body_pos[1]),
+            z=float(body_pos[2]),
+            yaw=derived["yaw_error"],
             vx=vel_filtered[0], vy=vel_filtered[1], vz=vel_filtered[2],
             z_tof_raw=derived["z_tof_raw"],
             roll=state["roll"], pitch=state["pitch"],
             dropout_timer=0,
+            marker_px=initial_px,
+            marker_py=initial_py,
         )
+
+        if np.isnan(obs).any():
+            self._node.get_logger().warn("NaN in initial observation, replacing with zeros")
+            obs = np.nan_to_num(obs, nan=0.0)
 
         return obs, {}
 
@@ -412,14 +589,13 @@ class DroneEnv(gym.Env):
         """Delegate to module-level pure function."""
         return compute_derived(state)
 
-    def _get_success_thresholds(self) -> tuple[float, float, float, float]:
+    def _get_success_thresholds(self) -> tuple[float, float, float]:
         """Get per-stage success thresholds for the current curriculum stage."""
         stage_cfg = CURRICULUM_STAGES.get(self._spawner.stage, {})
         vz_max = stage_cfg.get("success_vz_max", SUCCESS_VZ_MAX)
         vxy_max = stage_cfg.get("success_vxy_max", SUCCESS_VXY_MAX)
         d_xy_max = stage_cfg.get("success_d_xy_max", SUCCESS_D_XY_MAX)
-        yaw_max = stage_cfg.get("success_yaw_error_max", SUCCESS_YAW_ERROR_MAX)
-        return vz_max, vxy_max, d_xy_max, yaw_max
+        return vz_max, vxy_max, d_xy_max
 
     # ── Post-teleport stabilization ─────────────────────────────
 

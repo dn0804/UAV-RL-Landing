@@ -45,6 +45,11 @@ REWARD_KEYS = [
     "reward/horizontal",
     "reward/descent",
     "reward/yaw",
+    "reward/centering",
+    "reward/vel_xy",
+    "reward/vel_z",
+    "reward/vel_xy_uni",
+    "reward/velocity",
     "reward/jerk",
     "reward/time",
     "reward/total",
@@ -52,9 +57,10 @@ REWARD_KEYS = [
 
 # Diagnostic keys from rewards.py
 DIAG_KEYS = [
-    "diag/centering_gate",
-    "diag/gate_blend",
     "diag/delta_z",
+    "diag/pixel_dist",
+    "diag/v_xy",
+    "diag/proximity",
 ]
 
 # Terminal breakdown keys from termination.py (present only on final step)
@@ -64,7 +70,6 @@ TERMINAL_KEYS = [
     "terminal/miss_pos",
     "terminal/miss_vxy",
     "terminal/miss_vz",
-    "terminal/miss_yaw",
     "terminal/miss_avg",
 ]
 

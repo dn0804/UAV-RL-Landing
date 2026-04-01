@@ -1,25 +1,4 @@
 <?xml version="1.0" ?>
-<!--
-  DJI Tello model for RL training with realistic attitude dynamics.
-
-  Uses Gazebo MulticopterMotorModel + MulticopterVelocityControl.
-  Accepts Twist on cmd_vel, produces physical rotor forces/torques.
-
-  Key physical parameters derived from real Tello specs:
-    Mass:           87g total (85g body + 4×0.5g rotors)
-    Propellers:     3" (76mm dia), 2-blade
-    Motor-to-center:~63mm (at arm tips, NOT body edges)
-    Max RPM:        ~28,650 (3000 rad/s)
-    Hover RPM:      ~21,500 (2248 rad/s)
-    Thrust/weight:  ~1.78
-    Body dimensions: 98 × 92.5 × 41 mm (without prop guards)
-
-  CHANGELOG from original:
-  - rotorDragCoefficient: 6.63e-04 → 8.0e-06  (was ~100× too high for 87g)
-  - rotorVelocitySlowdownSim: 20 → 10  (standard practice)
-  - Motor positions: (±44,±42) → (±63,±63) mm  (arm tips, not body edges)
-  - PID gains retuned for corrected physics
--->
 <sdf version="1.8">
   <model name="tello">
     <link name="base_link">
@@ -37,9 +16,15 @@
       <collision name="base_collision">
         <geometry><box><size>0.098 0.0925 0.041</size></box></geometry>
       </collision>
+      
       <visual name="base_visual">
-        <geometry><box><size>0.098 0.0925 0.041</size></box></geometry>
-        <material><ambient>0.9 0.9 0.9 1</ambient><diffuse>0.9 0.9 0.9 1</diffuse></material>
+        <pose>0 0 0 0 0 0</pose> 
+        <geometry>
+          <mesh>
+            <uri>model://meshes/tello_body.glb</uri>
+            <scale>1 1 1</scale>
+          </mesh>
+        </geometry>
       </visual>
 
       <sensor name="front_camera" type="camera">
@@ -51,7 +36,7 @@
         </camera>
         <always_on>1</always_on>
         <update_rate>30</update_rate>
-        <visualize>true</visualize>
+        <visualize>false</visualize>
         <topic>camera/image_raw</topic>
       </sensor>
 
@@ -66,16 +51,10 @@
           <range><min>0.05</min><max>3.0</max><resolution>0.01</resolution></range>
         </ray>
         <always_on>1</always_on>
-        <visualize>true</visualize>
+        <visualize>false</visualize>
       </sensor>
     </link>
 
-    <!-- Rotor positions: real Tello motors sit at the tips of the arms,
-         ~63mm from center in each axis (total frame ~180mm diagonal with
-         prop guards).  DJI's "98 × 92.5 mm" spec is the central body
-         WITHOUT prop guards — the arms extend well beyond.  -->
-
-    <!-- Front-right (CCW) -->
     <link name="rotor_1">
       <pose>0.063 -0.063 0.025 0 0 0</pose>
       <inertial>
@@ -83,8 +62,13 @@
         <inertia><ixx>1.82e-07</ixx><iyy>1.82e-07</iyy><izz>3.63e-07</izz></inertia>
       </inertial>
       <visual name="rotor_1_visual">
-        <geometry><cylinder><radius>0.0381</radius><length>0.005</length></cylinder></geometry>
-        <material><ambient>0 0 0 1</ambient></material>
+        <pose>0 0 0.017 0 0 0</pose>
+        <geometry>
+          <mesh>
+            <uri>model://meshes/tello_prop.glb</uri>
+            <scale>1 1 1</scale>
+          </mesh>
+        </geometry>
       </visual>
     </link>
     <joint name="rotor_1_joint" type="revolute">
@@ -96,7 +80,6 @@
       </axis>
     </joint>
 
-    <!-- Front-left (CW) -->
     <link name="rotor_2">
       <pose>0.063 0.063 0.025 0 0 0</pose>
       <inertial>
@@ -104,8 +87,13 @@
         <inertia><ixx>1.82e-07</ixx><iyy>1.82e-07</iyy><izz>3.63e-07</izz></inertia>
       </inertial>
       <visual name="rotor_2_visual">
-        <geometry><cylinder><radius>0.0381</radius><length>0.005</length></cylinder></geometry>
-        <material><ambient>0 0 0 1</ambient></material>
+        <pose>0 0 0.017 0 0 0</pose>
+        <geometry>
+          <mesh>
+            <uri>model://meshes/tello_prop.glb</uri>
+            <scale>1 1 1</scale>
+          </mesh>
+        </geometry>
       </visual>
     </link>
     <joint name="rotor_2_joint" type="revolute">
@@ -117,7 +105,6 @@
       </axis>
     </joint>
 
-    <!-- Rear-left (CCW) -->
     <link name="rotor_3">
       <pose>-0.063 0.063 0.025 0 0 0</pose>
       <inertial>
@@ -125,8 +112,13 @@
         <inertia><ixx>1.82e-07</ixx><iyy>1.82e-07</iyy><izz>3.63e-07</izz></inertia>
       </inertial>
       <visual name="rotor_3_visual">
-        <geometry><cylinder><radius>0.0381</radius><length>0.005</length></cylinder></geometry>
-        <material><ambient>0.5 0.5 0.5 1</ambient></material>
+        <pose>0 0 0.017 0 0 0</pose>
+        <geometry>
+          <mesh>
+            <uri>model://meshes/tello_prop.glb</uri>
+            <scale>1 1 1</scale>
+          </mesh>
+        </geometry>
       </visual>
     </link>
     <joint name="rotor_3_joint" type="revolute">
@@ -138,7 +130,6 @@
       </axis>
     </joint>
 
-    <!-- Rear-right (CW) -->
     <link name="rotor_4">
       <pose>-0.063 -0.063 0.025 0 0 0</pose>
       <inertial>
@@ -146,8 +137,13 @@
         <inertia><ixx>1.82e-07</ixx><iyy>1.82e-07</iyy><izz>3.63e-07</izz></inertia>
       </inertial>
       <visual name="rotor_4_visual">
-        <geometry><cylinder><radius>0.0381</radius><length>0.005</length></cylinder></geometry>
-        <material><ambient>0.5 0.5 0.5 1</ambient></material>
+        <pose>0 0 0.017 0 0 0</pose>
+        <geometry>
+          <mesh>
+            <uri>model://meshes/tello_prop.glb</uri>
+            <scale>1 1 1</scale>
+          </mesh>
+        </geometry>
       </visual>
     </link>
     <joint name="rotor_4_joint" type="revolute">
@@ -158,20 +154,6 @@
         <dynamics><friction>0</friction></dynamics>
       </axis>
     </joint>
-
-    <!-- ═══════════════════════════════════════════════════════════
-         Motor model plugins — one per rotor.
-
-         Key fix: rotorDragCoefficient was 6.63e-04 (copied from a
-         ~3.5 kg reference drone).  On an 87g Tello this produced
-         68 m/s² of translational drag per m/s of body velocity —
-         nearly 7g — making the velocity controller fight itself
-         into oscillation and crash.  Corrected to 8.0e-06, which
-         gives ~0.08g per m/s (matching the drag-to-weight ratio
-         of the reference drone scaled to Tello mass).
-
-         rotorVelocitySlowdownSim reduced from 20 to 10 (standard).
-         ═══════════════════════════════════════════════════════════ -->
 
     <plugin filename="gz-sim-multicopter-motor-model-system"
             name="gz::sim::systems::MulticopterMotorModel">
@@ -240,17 +222,6 @@
       <actuator_number>3</actuator_number>
       <motorType>velocity</motorType>
     </plugin>
-
-    <!-- ═══════════════════════════════════════════════════════════
-         Velocity controller — cascaded PID:
-           velocity error → desired attitude  (velocityGain)
-           attitude error → desired ang rate  (attitudeGain)
-           ang rate error → motor deltas      (angularRateGain)
-
-         Gains tuned conservatively for 87g drone with corrected
-         drag.  If the drone feels sluggish, increase velocityGain
-         first.  If it oscillates, reduce attitudeGain.
-         ═══════════════════════════════════════════════════════════ -->
 
     <plugin filename="gz-sim-multicopter-control-system"
             name="gz::sim::systems::MulticopterVelocityControl">

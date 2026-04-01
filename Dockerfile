@@ -23,6 +23,13 @@ ENV GZ_VERSION=garden
 # Source ROS 2 automatically in bash
 RUN echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc
 
+# Source ROS 2 automatically and inject custom aliases
+RUN echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc && \
+    { \
+      echo 'alias train="bash /workspaces/scripts/run.sh"'; \
+      echo "alias unfollow=\"gz service -s /gui/follow --reqtype gz.msgs.StringMsg --reptype gz.msgs.Boolean --timeout 2000 --req 'data: \\\"\\\"'\""; \
+    } >> ~/.bash_aliases
+
 # Install Gazebo Garden, Dev Headers, and the ROS 2 Bridge
 RUN wget https://packages.osrfoundation.org/gazebo.gpg -O /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg && \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/pkgs-osrf-archive-keyring.gpg] http://packages.osrfoundation.org/gazebo/ubuntu-stable jammy main" | tee /etc/apt/sources.list.d/gazebo-stable.list > /dev/null && \
@@ -52,4 +59,4 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 RUN uv pip install -r /tmp/requirements.txt
 
-WORKDIR /workspace
+WORKDIR /workspaces

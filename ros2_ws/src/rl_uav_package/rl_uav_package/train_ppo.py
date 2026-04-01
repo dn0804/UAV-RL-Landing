@@ -25,11 +25,50 @@ from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from rl_uav_package.config.constants import (
-    PPO_CONFIG, NET_ARCH, ACTIVATION_FN, LOG_STD_INIT
+    PPO_CONFIG, NET_ARCH, ACTIVATION_FN, LOG_STD_INIT, LOG_STD_MIN
 )
 from rl_uav_package.envs.drone_env import DroneEnv
 from rl_uav_package.utils.training_logger import TrainingLogger
 from rl_uav_package.curriculum.manager import CurriculumManager
+
+# ── SafePPO: NaN watchdog + std floor ───────────────────────────────
+
+class SafePPO(PPO):
+    """PPO with built-in NaN recovery and entropy floor.
+
+    Overrides train() to:
+      1. Save a copy of weights before SGD
+      2. Run the normal PPO update
+      3. Check for NaN in any parameter — if found, revert to saved weights
+      4. Clamp log_std to LOG_STD_MIN to prevent entropy collapse
+
+    This is serialization-safe (no closures capturing external state),
+    unlike the monkey-patching approach which broke checkpoint saving.
+    """
+
+    def __init__(self, *args, log_std_min: float = LOG_STD_MIN, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.log_std_min = log_std_min
+        self._nan_revert_count = 0
+
+    def train(self) -> None:
+        # Save weights before SGD
+        saved = {k: v.clone() for k, v in self.policy.state_dict().items()}
+
+        # Normal PPO update
+        super().train()
+
+        # Check for NaN corruption
+        has_nan = any(th.isnan(p).any() for p in self.policy.parameters())
+        if has_nan:
+            self.policy.load_state_dict(saved)
+            self._nan_revert_count += 1
+            print(f"[NaN WATCHDOG] Reverted weights "
+                  f"(occurrence #{self._nan_revert_count})")
+
+        # Enforce std floor
+        with th.no_grad():
+            self.policy.log_std.clamp_(min=self.log_std_min)
 
 # ── Linear learning rate schedule ────────────────────────────────────
 
@@ -63,7 +102,7 @@ def parse_args(argv=None):
         help="Total training timesteps (default: 500k for Stage 1 baseline).",
     )
     parser.add_argument(
-        "--stage", type=int, default=0, choices=[0, 1, 2, 3, 4, 5, 6],
+        "--stage", type=int, default=0, choices=[0, 1, 2, 3, 4, 5, 6, 7],
         help="Curriculum stage to train in (default: 0).",
     )
     parser.add_argument(
@@ -152,18 +191,27 @@ def main(argv=None):
     # ── Create or load model ─────────────────────────────────────
     if args.resume:
         print(f"[INFO] Resuming from {args.resume}")
-        model = PPO.load(
+        model = SafePPO.load(
             args.resume,
             env=env,
             tensorboard_log=args.log_dir,
             learning_rate=linear_schedule(PPO_CONFIG["learning_rate"]),
         )
-        model.ent_coef = 0.001 # Override entropy coefficient for remaining training
+        model.ent_coef = PPO_CONFIG["ent_coef"]  # use config value
+        model.target_kl = None                     # no KL early stopping
+        model.log_std_min = LOG_STD_MIN            # std floor for SafePPO
         # Override LR schedule for remaining training
         model.lr_schedule = model.learning_rate
+        # Clamp log_std if it collapsed during previous training
+        with th.no_grad():
+            old_std = model.policy.log_std.exp().mean().item()
+            model.policy.log_std.clamp_(min=LOG_STD_MIN)
+            new_std = model.policy.log_std.exp().mean().item()
+            if old_std != new_std:
+                print(f"[INFO] log_std clamped: std {old_std:.3f} → {new_std:.3f}")
     else:
         print("[INFO] Initializing new PPO agent...")
-        model = PPO(
+        model = SafePPO(
             "MlpPolicy",
             env,
             learning_rate=linear_schedule(PPO_CONFIG["learning_rate"]),
@@ -176,6 +224,7 @@ def main(argv=None):
             ent_coef=PPO_CONFIG["ent_coef"],
             vf_coef=PPO_CONFIG["vf_coef"],
             max_grad_norm=PPO_CONFIG["max_grad_norm"],
+            log_std_min=LOG_STD_MIN,
             policy_kwargs=policy_kwargs,
             verbose=1,
             seed=args.seed,

@@ -4,8 +4,8 @@
 
     <physics name="fast_sim" type="ignored">
       <max_step_size>0.001</max_step_size>
-      <real_time_factor>0</real_time_factor>
-      <real_time_update_rate>0</real_time_update_rate>
+      <real_time_factor>1</real_time_factor>
+      <real_time_update_rate>1000</real_time_update_rate>
     </physics>
 
     <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
@@ -16,7 +16,7 @@
     </plugin>
 
     <light type="directional" name="sun">
-      <cast_shadows>true</cast_shadows>
+      <!--<cast_shadows>true</cast_shadows>-->
       <pose>0 0 10 0 0 0</pose>
       <diffuse>0.8 0.8 0.8 1</diffuse>
       <specular>0.2 0.2 0.2 1</specular>
@@ -34,40 +34,61 @@
       </link>
     </model>
 
-    <model name="wall">
-      <static>true</static>
-      <pose>-0.025 0 1.5 0 0 0</pose>
-      <link name="link">
-        <collision name="collision"><geometry><box><size>0.05 6.0 3.0</size></box></geometry></collision>
-        <visual name="visual">
-          <geometry><box><size>0.05 6.0 3.0</size></box></geometry>
-          <material><ambient>0.92 0.91 0.87 1</ambient><diffuse>0.92 0.91 0.87 1</diffuse></material>
-        </visual>
-      </link>
-    </model>
-
+    <!-- Desk: centered at world origin, rotated 90deg → 1.00m(X) x 0.60m(Y) x 0.75m(Z) -->
     <model name="desk">
       <static>true</static>
-      <pose>0.30 0 0.375 0 0 0</pose>
+      <pose>0 0 0.375 0 0 1.5708</pose>
       <link name="link">
         <collision name="collision"><geometry><box><size>0.60 1.00 0.75</size></box></geometry></collision>
+      <visual name="visual">
+        <geometry><mesh><uri>model://meshes/table.glb</uri></mesh></geometry>
+      </visual>
+      </link>
+    </model>
+
+    <model name="landing_pad">
+      <static>true</static>
+      <pose>0.05 0 0.75 0 0 0</pose>
+      <link name="link">
+      <visual name="visual">
+        <geometry><cylinder><radius>0.15</radius><length>0.01</length></cylinder></geometry>
+        <material><ambient>0.1 0.7 0.1 1</ambient><diffuse>0.1 0.7 0.1 1</diffuse></material>
+      </visual>
+      </link>
+    </model>
+
+    <!-- Black pole stand: 35cm tall, 1cm diameter, sitting on table surface -->
+    <!-- After rotation, skinny axis=Y(0.60m), long axis=X(1.00m) -->
+    <!-- Back edge = -X side. Pole at X=-0.40, Y=0 (centered on skinny axis) -->
+    <model name="marker_pole">
+      <static>true</static>
+      <pose>-0.40 0 0.925 0 0 0</pose>
+      <link name="link">
         <visual name="visual">
-          <geometry><box><size>0.60 1.00 0.75</size></box></geometry>
-          <material><ambient>0.55 0.40 0.25 1</ambient><diffuse>0.55 0.40 0.25 1</diffuse></material>
+          <geometry><cylinder><radius>0.005</radius><length>0.35</length></cylinder></geometry>
+          <material><ambient>0.05 0.05 0.05 1</ambient><diffuse>0.05 0.05 0.05 1</diffuse></material>
         </visual>
       </link>
     </model>
 
+    <!-- ArUco marker: 20x20cm, vertical (facing +X toward drone), center on pole top -->
+    <!-- At back edge of rotated table: X=-0.40, Y=0, Z=1.10 -->
     <model name="aruco_marker">
       <static>true</static>
-      <pose>0.005 0 0.90 0 0 0</pose>
+      <pose>-0.40 0 1.10 0 0 0</pose>
       <link name="link">
         <visual name="visual">
           <geometry><box><size>0.01 0.20 0.20</size></box></geometry>
           <material>
-            <ambient>0.9 0.9 0.9 1</ambient>
-            <diffuse>0.9 0.9 0.9 1</diffuse>
-            <pbr><metal><albedo_map>aruco_marker.png</albedo_map></metal></pbr>
+            <ambient>1.0 1.0 1.0 1</ambient>
+            <diffuse>1.0 1.0 1.0 1</diffuse>
+            <emissive>1.0 1.0 1.0 1</emissive>
+            <pbr>
+              <metal>
+                <albedo_map>aruco_marker.png</albedo_map>
+                <emissive_map>aruco_marker.png</emissive_map>
+              </metal>
+            </pbr>
           </material>
         </visual>
       </link>

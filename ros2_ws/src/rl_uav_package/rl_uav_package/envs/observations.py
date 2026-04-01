@@ -1,23 +1,26 @@
 """
 Observation vector assembly.
 
-Builds the 29-dimensional normalized observation from raw sensor data.
-Owns the action history ring buffer. (Cosine correction removed: 
-z_tof_raw is already true vertical height from the environment).
+Builds the 33-dimensional normalized observation from raw sensor data.
+Owns the action history ring buffer.
 The EMA velocity filter is external — drone_env calls it before passing
 filtered velocities here.
 
-Channel layout (29 total):
-    [0]     x               forward distance to marker (vision or odom)
-    [1]     y               lateral offset
-    [2]     z               vertical offset
-    [3]     yaw             heading relative to marker
+Channel layout (33 total):
+    [0]     x               forward distance to marker (vision, body frame)
+    [1]     y               lateral offset (vision, body frame)
+    [2]     z               vertical offset (vision, body frame)
+    [3]     yaw             heading relative to marker (odom-derived)
     [4]     vx              forward velocity (EMA-filtered)
     [5]     vy              lateral velocity (EMA-filtered)
     [6]     vz              vertical velocity (EMA-filtered)
     [7]     z_tof           true vertical clearance to surface below
     [8]     dropout_timer   steps since last marker detection
-    [9..28] action history  5 most recent actions × 4 axes, newest first
+    [9]     roll            body roll angle (IMU)
+    [10]    pitch           body pitch angle (IMU)
+    [11]    marker_px       marker pixel x in frame, normalized [-1, 1]
+    [12]    marker_py       marker pixel y in frame, normalized [-1, 1]
+    [13..32] action history 5 most recent actions × 4 axes, newest first
 """
 
 import math
@@ -81,21 +84,32 @@ class ObservationBuilder:
         roll: float,
         pitch: float,
         dropout_timer: int,
+        marker_px: float = 0.0,
+        marker_py: float = 0.0,
     ) -> np.ndarray:
-        """Assemble, normalize, and clip the full observation vector."""
-        
+        """Assemble, normalize, and clip the full observation vector.
+
+        Parameters
+        ----------
+        marker_px, marker_py : float
+            Marker center position in camera frame, normalized so that
+            (0, 0) = frame center, (-1, -1) = top-left, (1, 1) = bottom-right.
+            Frozen at last-known values during marker dropout.
+        """
+
         # 1. Cap the dropout timer
         dropout_capped = min(dropout_timer, DROPOUT_TIMER_CAP)
 
-        # 2. Assemble the 9 sensor channels
-        # z_tof_raw from the env is already true vertical clearance; no cosine correction needed.
+        # 2. Assemble the 13 sensor channels
         sensor = np.array([
             x, y, z, yaw,
             vx, vy, vz,
-            z_tof_raw, 
+            z_tof_raw,
             float(dropout_capped),
             roll,
             pitch,
+            marker_px,
+            marker_py,
         ], dtype=np.float32)
 
         # 3. Flatten action history (newest first)
