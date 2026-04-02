@@ -4,8 +4,6 @@ ros2_ws/install/
 ros2_ws/log/
 ros2_ws/logs/
 
-ros2_ws/src/px4_msgs/
-
 # Python caches
 __pycache__/
 *.pyc
