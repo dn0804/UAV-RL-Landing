@@ -48,7 +48,7 @@ ENV GZ_VERSION=garden
 
 # ── Shell aliases ────────────────────────────────────────────
 RUN { \
-      echo 'alias train="bash /workspace/scripts/run.sh"'; \
+      echo 'alias train="bash /workspaces/UAV-RL-Landing/scripts/run.sh"'; \
       echo "alias unfollow=\"gz service -s /gui/follow --reqtype gz.msgs.StringMsg --reptype gz.msgs.Boolean --timeout 2000 --req 'data: \\\"\\\"'\""; \
     } >> ~/.bash_aliases
 

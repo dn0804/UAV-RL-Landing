@@ -27,3 +27,5 @@ events.out.tfevents.*
 .devcontainer/
 
 rl_uav_package.egg-info/
+
+UAV-RL-Landing.code-workspace
