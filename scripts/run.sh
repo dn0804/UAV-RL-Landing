@@ -160,7 +160,7 @@ if [ "$GUI" = true ]; then
         --reqtype gz.msgs.Vector3d \
         --reptype gz.msgs.Boolean \
         --timeout 2000 \
-        --req 'x: -1.5, y: 0, z: 0.5' > /dev/null 2>&1 || true
+        --req 'x: -1.0, y: 0, z: 0.5' > /dev/null 2>&1 || true
 fi
 
 # ── Training ─────────────────────────────────────────────────

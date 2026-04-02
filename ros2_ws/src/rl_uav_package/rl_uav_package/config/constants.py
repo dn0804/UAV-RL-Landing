@@ -1,414 +1,305 @@
 """
 Central configuration for the UAV RL Landing project.
 
-Every tunable number lives here. Other modules import from this file
-and never hardcode physical constants, reward weights, or scale factors.
-Section references (§) point to the project plan for rationale.
+Positions reconciled against tello_world.sdf (source of truth):
+    Desk:        center (0, 0, 0.375), rotated 90° → 1.00m(X) × 0.60m(Y) × 0.75m(Z)
+    Landing pad: (0.05, 0, 0.75), cylinder r=0.15
+    Marker pole: (-0.40, 0, 0.925), 35cm tall
+    ArUco marker:(-0.40, 0, 1.10), 20×20cm, faces +X
+
+Training pipeline (every stage, every episode):
+    Approach → hover checkpoint (+bonus) → descend → land (+success)
 """
 
 import math
 import numpy as np
 
 # ============================================================
-# Physical Setup  (§3)
+# Physical Setup
 # ============================================================
 
-# ArUco marker center is at the coordinate origin on the wall (x=0 plane).
-# The landing pad is on the desk surface directly in front of the marker.
-#
-# Placement is optimized so the entire marker stays within the Tello's
-# 49° vertical FOV throughout the final descent to touchdown:
-#   marker_z = PAD_ELEVATION - HALF_MARKER + pad_offset × tan(24.5°)
-# This gives a ~25.6 cm continuous descent window from z ≈ 1.006 down
-# to z = PAD_ELEVATION with the marker fully visible.
-LANDING_PAD_RADIUS = 0.10               # m  (§3.2)
-LANDING_PAD_FORWARD_OFFSET = 0.50       # m in front of marker  (was 0.30)
+DESK_X_MIN = -0.50
+DESK_X_MAX = 0.50
+DESK_Y_MIN = -0.30
+DESK_Y_MAX = 0.30
+PAD_ELEVATION = 0.75
 
-# Default pad elevation (desk height). Adjustable per experiment.
-PAD_ELEVATION = 0.75                    # m above ground  (§3.2)
+LANDING_PAD_RADIUS = 0.15
+PAD_WORLD_POS = (0.05, 0.0, PAD_ELEVATION)
 
-# Marker height derived from the exact FOV constraint:
-#   marker_z = PAD_ELEVATION - 0.10 + pad_offset × tan(VFOV/2)
-# This places the marker's bottom corners exactly at the lower VFOV
-# edge when the drone is at pad height, maximizing the descent window.
-MARKER_HEIGHT_ABOVE_PAD = -0.10 + LANDING_PAD_FORWARD_OFFSET * math.tan(math.radians(24.5))
-MARKER_Z = PAD_ELEVATION + MARKER_HEIGHT_ABOVE_PAD
-
-# World-frame reference positions.
-# Coordinate system: wall at x=0, marker at (0, 0, MARKER_Z), +x into room.
-MARKER_WORLD_POS = (0.0, 0.0, MARKER_Z)            # on the wall
-PAD_WORLD_POS = (LANDING_PAD_FORWARD_OFFSET, 0.0, PAD_ELEVATION)  # in front of marker
-
-# Marker half-width (used by spawner FOV validation)
-MARKER_HALF_WIDTH = 0.10                # m; half of 0.20m marker
+MARKER_CENTER_Z = 1.10
+MARKER_WORLD_POS = (-0.40, 0.0, MARKER_CENTER_Z)
+MARKER_Z = MARKER_CENTER_Z
+MARKER_HALF_WIDTH = 0.10
+MARKER_SIZE = 0.20
+MARKER_ID = 0
+MARKER_DICTIONARY = "DICT_4X4_50"
+LANDING_PAD_FORWARD_OFFSET = PAD_WORLD_POS[0]
 
 # ============================================================
-# Observation Space  (§6)
+# Observation Space
 # ============================================================
-
-# Channel layout of the 33-dim observation vector:
-#   [0]  x          forward distance to marker (vision, body frame)
-#   [1]  y          lateral offset (vision, body frame)
-#   [2]  z          vertical offset (vision, body frame)
-#   [3]  yaw        heading relative to marker (odom-derived)
-#   [4]  vx         forward velocity (odom, EMA-filtered)
-#   [5]  vy         lateral velocity (odom, EMA-filtered)
-#   [6]  vz         vertical velocity (odom, EMA-filtered)
-#   [7]  z_tof      cosine-corrected ToF range (§6.2, §6.5)
-#   [8]  dropout_t  steps since last marker detection (§6.4)
-#   [9]  roll       body roll angle (IMU)
-#   [10] pitch      body pitch angle (IMU)
-#   [11] marker_px  marker pixel x in frame, normalized [-1, 1]
-#   [12] marker_py  marker pixel y in frame, normalized [-1, 1]
-#   [13..32]        prev_actions: 5 steps × 4 axes (§6.3)
 
 OBS_DIM = 33
 ACTION_DIM = 4
-ACTION_HISTORY_STEPS = 5  # number of past actions in obs  (§6.3)
+ACTION_HISTORY_STEPS = 5
 
-# Per-channel normalization scale factors  (§6.6)
-# Order must match the channel layout above.
 OBS_SCALE = np.array([
-    4.0,    # x        (§6.6: forward range up to ~4.4 m)
-    3.5,    # y        (§6.6: lateral extent ±3.5 m)
-    2.5,    # z        (§6.6: vertical extent)
-    math.pi,# yaw      (§6.6: ±π rad)
-    2.0,    # vx       (§6.6: indoor speed cap)
-    2.0,    # vy
-    2.0,    # vz
-    2.5,    # z_tof    (§6.6: matches z scale)
-    30.0,   # dropout  (§6.4: cap at 30 steps)
-    math.pi,# roll
-    math.pi,# pitch
-    1.0,    # marker_px (already normalized to [-1, 1])
-    1.0,    # marker_py (already normalized to [-1, 1])
-] + [1.0] * (ACTION_HISTORY_STEPS * ACTION_DIM),  # prev actions already in [-1, 1]
+    5.5, 5.0, 2.0, math.pi,
+    2.0, 2.0, 2.0,
+    2.0, 30.0,
+    math.pi, math.pi,
+    1.0, 1.0,
+] + [1.0] * (ACTION_HISTORY_STEPS * ACTION_DIM),
     dtype=np.float32,
 )
 
-OBS_CLIP = 1.5  # symmetric clip after normalization  (§6.6)
-
-# Dropout timer  (§6.4)
-DROPOUT_TIMER_CAP = 30  # steps; beyond this, data is dangerously stale
+OBS_CLIP = 1.5
+DROPOUT_TIMER_CAP = 30
 
 # ============================================================
-# Action Space  (§7)
+# Action Space
 # ============================================================
 
-# Agent outputs continuous [-1, 1] on 4 axes.
-# For deployment: multiply by 100, round, clamp to [-100, 100].
 ACTION_LOW = -1.0
 ACTION_HIGH = 1.0
 
 # ============================================================
-# Reward Function  (§8)
-#
-# All weights scaled to keep total returns in roughly [−35, +30].
-# This prevents value function gradient overflow (NaN) that occurred
-# with the original [−150, +125] range.  The 5x reduction cuts value
-# loss by 25x (MSE) and gradient magnitude by 5x.
+# Reward Function
 # ============================================================
 
-# Horizontal centering  (§8.3)
+# ── Approach + centering ─────────────────────────────────────
+
 W_HORIZONTAL = 2.0
+W_Z_ALIGN = 3.0
 
-# Descent reward  (§8.4)
-# Plain delta-z reward: positive when descending, negative when ascending.
-W_DESCENT = 4.0
-
-# Marker tracking / yaw-to-bearing  (§8.5)
 W_YAW = 0.006
-YAW_PENALTY_D_MIN = 0.3     # m; penalty floor distance (caps at close range)
+YAW_PENALTY_D_MIN = 0.3
 
-# Pixel centering penalty
 W_CENTERING = 0.10
-CENTERING_DEADZONE = 0.15   # normalized; 15% of half-frame in each axis
+CENTERING_DEADZONE = 0.15
 
-# Jerk penalty  (§8.6)
-W_JERK = 0.004
-
-# Velocity penalty (proximity-scaled)
-# Penalizes speed proportional to closeness to the pad.  Horizontal
-# speed is weighted more heavily — lateral overshoot at close range is
-# hard to recover from.  Vertical gets a lighter touch so the descent
-# reward (W_DESCENT = 4.0) still dominates at range.
-#
-# proximity = D_REF / max(d_pad, D_REF)  →  1.0 inside D_REF, decays beyond
-# r_vel_xy = -W_VEL_XY * v_xy * proximity
-# r_vel_z  = -W_VEL_Z  * |vz| * proximity
 W_VEL_XY = 0.07
 W_VEL_Z = 0.04
-VEL_PENALTY_D_REF = 0.5    # m; penalty at full strength inside this radius
-
+VEL_PENALTY_D_REF = 0.5
 W_VEL_XY_UNI = 0.10
 MAX_VEL_XY = 0.5
 
-# Time penalty  (§8.6)
-# −0.01/step × 300 steps = −3.0 max.  Forward progress at 0.5 m/s
-# yields +0.1/step from horizontal centering alone, easily overcoming
-# the time penalty.  Timeout (−3 shaping + −18 terminal = −21) is now
-# better than a wall crash (−24.5), fixing the old kamikaze incentive.
-W_TIME = 0.01
+W_JERK = 0.004
+W_TIME = 0.02
 
-# Terminal rewards  (§8.9)
-R_SUCCESS = 20.0
+# ── Pre-checkpoint hover bonus ───────────────────────────────
+
+W_HOVER_BONUS = 0.05
+HOVER_Z_TOLERANCE = 0.30
+
+# ── Hover checkpoint ─────────────────────────────────────────
+
+R_HOVER_CHECKPOINT = 15.0
+
+# ── Post-checkpoint descent ──────────────────────────────────
+
+W_DESCENT_COMMITTED = 6.0
+W_XY_HOLD = 0.15
+
+DESCENT_GATE_D_PAD = 0.25
+DESCENT_COMMIT_Z_MARGIN = 0.10
+
+# ── Dropout freeze (pre-checkpoint only) ─────────────────────
+# When the marker is lost before checkpoint, penalize XYZ action
+# commands to teach the drone to stop and search with yaw only.
+# Grace period of 3 steps (0.3s) to ignore detection flicker.
+W_DROPOUT_FREEZE = 0.5       # per unit of |action_xyz| per step
+DROPOUT_GRACE_STEPS = 6    # steps before freeze penalty activates
+
+# ── Terminal rewards ─────────────────────────────────────────
+
+R_SUCCESS = 15.0
+R_SUCCESS_NO_CHECKPOINT = 5.0
 R_CRASH = -25.0
-R_TIMEOUT = -12.0
+R_TIMEOUT = -22.0
 
 # ============================================================
-# Episode Termination  (§8.9)
+# Episode Termination — Conical Operational Volume
+#
+# 3D cone with tip 0.5m behind marker, opening in +X direction.
+# Half-angle 60° (120° full), length 6m.
+# Flat floor at z=0.20, flat ceiling at Z_CEILING.
 # ============================================================
 
-# Operational volume
-X_MIN = 0.08    # m; wall collision boundary — reduced from 0.05 for
-                #     attitude dynamics: the drone must pitch backward to
-                #     decelerate, which takes time and distance.  Gazebo
-                #     collision geometry prevents actual wall penetration.
-X_MAX = 5.0     # m; Stage 3 max + 1 m buffer
-Y_MIN = -4.0    # m
-Y_MAX = 4.0     # m
-Z_MAX = 2.5     # m; no useful trajectory above this
+# Cone geometry
+CONE_TIP_X = MARKER_WORLD_POS[0] - 0.50   # -0.90
+CONE_TIP_Y = MARKER_WORLD_POS[1]          #  0.00
+CONE_TIP_Z = MARKER_CENTER_Z              #  1.10
+CONE_HALF_ANGLE_RAD = math.radians(60)    # 120° full opening
+CONE_COS_HALF_ANGLE = math.cos(CONE_HALF_ANGLE_RAD)  # 0.5
+CONE_LENGTH = 6.0                          # m from tip along +X axis
+
+# Flat floor and ceiling
+Z_FLOOR = 0.20       # m — drone must stay above this
+Z_CEILING = 1.95     # m — highest spawn point, drone must stay below
 
 # Surface contact
-TOF_CONTACT_THRESHOLD = 0.03  # m; any ToF below this = surface contact
+TOF_CONTACT_THRESHOLD = 0.03
 
-# Success criteria (all must be met simultaneously)
-SUCCESS_D_XY_MAX = 0.10      # m; horizontal distance to pad center
-SUCCESS_VZ_MAX = 1.5         # m/s; vertical speed at touchdown
-SUCCESS_VXY_MAX = 1.0        # m/s; horizontal speed at touchdown
+# Landing success criteria
+SUCCESS_D_XY_MAX = 0.10
+SUCCESS_VZ_MAX = 1.5
+SUCCESS_VXY_MAX = 1.0
 
 # Crash: attitude limits
 CRASH_ROLL_MAX = math.radians(45)
 CRASH_PITCH_MAX = math.radians(45)
 
-# Episode length
-MAX_STEPS = 300              # 30 seconds at 10 Hz  (§8.6)
+MAX_STEPS = 150
 
 # ============================================================
-# EMA Velocity Filter  (§11.5)
+# Hover Checkpoint Conditions
 # ============================================================
 
-EMA_ALPHA = 0.4  # smoothing parameter; τ ≈ 0.25 s at 10 Hz
+HOVER_DWELL_STEPS = 10
+HOVER_Z_MIN_CLEARANCE = 0.10
 
 # ============================================================
-# ToF Sensor  (§6.5)
+# EMA Velocity Filter
 # ============================================================
 
-# Cosine correction applied before obs: z_corrected = z_raw * cos(pitch) * cos(roll)
-# No constants needed — just roll and pitch from IMU at runtime.
+EMA_ALPHA = 0.4
 
 # ============================================================
-# Curriculum Stages  (§9)
+# Curriculum Stages
 # ============================================================
 
 CURRICULUM_STAGES = {
-    # ── Close-range velocity tightening (each ~25% stricter) ──
     0: {
-        "name": "relaxed_landing",
-        "d_min": 0.3,
-        "d_max": 0.8,
-        "angle_max": math.radians(10),
-        "furniture_count": (0, 0),
-        "vision_dropout_rate": 0.0,
-        "odom_noise_tier": 1,
-        "success_vz_max": 1.2,
-        "success_vxy_max": 1.0,
-        "success_d_xy_max": 0.25,
+        "name": "close_easy",
+        "d_min": 0.5, "d_max": 1.5,
+        "angle_max": math.radians(15),
+        "hover_d_pad_max": 0.30, "hover_vxy_max": 0.5, "hover_dwell_steps": 5,
+        "success_vz_max": 1.2, "success_vxy_max": 0.8, "success_d_xy_max": 0.25,
+        "max_steps": 150,
     },
     1: {
-        "name": "easy_landing",
-        "d_min": 0.3,
-        "d_max": 0.8,
-        "angle_max": math.radians(10),
-        "furniture_count": (0, 0),
-        "vision_dropout_rate": 0.0,
-        "odom_noise_tier": 1,
-        "success_vz_max": 0.9,
-        "success_vxy_max": 0.75,
-        "success_d_xy_max": 0.22,
+        "name": "close_moderate",
+        "d_min": 0.5, "d_max": 1.5,
+        "angle_max": math.radians(15),
+        "hover_d_pad_max": 0.25, "hover_vxy_max": 0.4, "hover_dwell_steps": 8,
+        "success_vz_max": 0.9, "success_vxy_max": 0.6, "success_d_xy_max": 0.22,
+        "max_steps": 150,
     },
     2: {
-        "name": "moderate_landing",
-        "d_min": 0.3,
-        "d_max": 0.8,
-        "angle_max": math.radians(10),
-        "furniture_count": (0, 0),
-        "vision_dropout_rate": 0.0,
-        "odom_noise_tier": 1,
-        "success_vz_max": 0.65,
-        "success_vxy_max": 0.55,
-        "success_d_xy_max": 0.19,
+        "name": "close_firm",
+        "d_min": 0.5, "d_max": 1.5,
+        "angle_max": math.radians(20),
+        "hover_d_pad_max": 0.20, "hover_vxy_max": 0.35, "hover_dwell_steps": 10,
+        "success_vz_max": 0.7, "success_vxy_max": 0.45, "success_d_xy_max": 0.20,
+        "max_steps": 150,
     },
     3: {
-        "name": "firm_landing",
-        "d_min": 0.3,
-        "d_max": 0.8,
-        "angle_max": math.radians(10),
-        "furniture_count": (0, 0),
-        "vision_dropout_rate": 0.0,
-        "odom_noise_tier": 1,
-        "success_vz_max": 0.45,
-        "success_vxy_max": 0.40,
-        "success_d_xy_max": 0.16,
+        "name": "close_precise",
+        "d_min": 0.5, "d_max": 1.5,
+        "angle_max": math.radians(25),
+        "hover_d_pad_max": 0.18, "hover_vxy_max": 0.30, "hover_dwell_steps": 10,
+        "success_vz_max": 0.5, "success_vxy_max": 0.35, "success_d_xy_max": 0.18,
+        "max_steps": 150,
     },
     4: {
-        "name": "precision_landing",
-        "d_min": 0.3,
-        "d_max": 0.8,
-        "angle_max": math.radians(10),
-        "furniture_count": (0, 0),
-        "vision_dropout_rate": 0.0,
-        "odom_noise_tier": 1,
-        "success_vz_max": 0.33,
-        "success_vxy_max": 0.25,
-        "success_d_xy_max": 0.13,
+        "name": "medium_moderate",
+        "d_min": 0.5, "d_max": 2.5,
+        "angle_max": math.radians(30),
+        "hover_d_pad_max": 0.20, "hover_vxy_max": 0.35, "hover_dwell_steps": 10,
+        "success_vz_max": 0.6, "success_vxy_max": 0.40, "success_d_xy_max": 0.18,
+        "max_steps": 200,
     },
-    # ── Spatial expansion (velocity holds at precision level) ──
     5: {
-        "name": "medium_range",
-        "d_min": 0.5,
-        "d_max": 1.5,
-        "angle_max": math.radians(25),
-        "furniture_count": (0, 0),
-        "vision_dropout_rate": 0.0,
-        "odom_noise_tier": 1,
-        "success_vz_max": 0.33,
-        "success_vxy_max": 0.25,
-        "success_d_xy_max": 0.13,
+        "name": "medium_precise",
+        "d_min": 0.5, "d_max": 2.5,
+        "angle_max": math.radians(40),
+        "hover_d_pad_max": 0.18, "hover_vxy_max": 0.30, "hover_dwell_steps": 10,
+        "success_vz_max": 0.45, "success_vxy_max": 0.30, "success_d_xy_max": 0.15,
+        "max_steps": 200,
     },
     6: {
-        "name": "full_cone_moderate",
-        "d_min": 0.3,
-        "d_max": 4.0,
-        "angle_max": math.radians(60),
-        "furniture_count": (0, 0),
-        "vision_dropout_rate": 0.0,
-        "odom_noise_tier": 1,
-        "success_vz_max": 0.50,
-        "success_vxy_max": 0.40,
-        "success_d_xy_max": 0.15,
+        "name": "far_moderate",
+        "d_min": 0.5, "d_max": 4.0,
+        "angle_max": math.radians(45),
+        "hover_d_pad_max": 0.20, "hover_vxy_max": 0.35, "hover_dwell_steps": 10,
+        "success_vz_max": 0.5, "success_vxy_max": 0.35, "success_d_xy_max": 0.18,
+        "max_steps": 300,
     },
     7: {
-        "name": "full_cone",
-        "d_min": 0.3,
-        "d_max": 4.0,
+        "name": "far_precise",
+        "d_min": 0.5, "d_max": 4.0,
         "angle_max": math.radians(60),
-        "furniture_count": (0, 0),
-        "vision_dropout_rate": 0.0,
-        "odom_noise_tier": 1,
-        "success_vz_max": 0.33,
-        "success_vxy_max": 0.25,
-        "success_d_xy_max": 0.10,
+        "hover_d_pad_max": 0.15, "hover_vxy_max": 0.25, "hover_dwell_steps": 10,
+        "success_vz_max": 0.4, "success_vxy_max": 0.25, "success_d_xy_max": 0.12,
+        "max_steps": 300,
     },
 }
 
-# Stage transition  (§9, blended transitions)
-CURRICULUM_PROMOTION_THRESHOLD = 0.75   # success rate to trigger transition
-CURRICULUM_WINDOW_SIZE = 300            # rolling episode window for success rate
-CURRICULUM_BLEND_EPISODES = 1000        # episodes over which to blend distributions
-CURRICULUM_BLEND_STEPS = 5              # number of ratio steps (80/20→60/40→...)
+CURRICULUM_PROMOTION_THRESHOLD = 0.75
+CURRICULUM_WINDOW_SIZE = 300
+CURRICULUM_BLEND_EPISODES = 1000
+CURRICULUM_BLEND_STEPS = 5
 
 # ============================================================
-# PPO Hyperparameters  (§10.2)
+# PPO Hyperparameters
 # ============================================================
 
 PPO_CONFIG = {
-    "learning_rate": 0.00015,
-    "gamma": 0.99,
-    "gae_lambda": 0.95,
-    "clip_range": 0.2,
-    "n_epochs": 10,
-    "batch_size": 64,
-    "n_steps": 2048,             # rollout buffer per iteration
-    "ent_coef": 0.0001,           # reduced for attitude dynamics — motor
-                                  # physics already provide ample exploration
-                                  # noise; too much entropy prevents std
-                                  # from decreasing
-    "vf_coef": 0.5,              # SB3 default
-    "max_grad_norm": 0.5,        # SB3 default
+    "learning_rate": 0.00015, "gamma": 0.99, "gae_lambda": 0.95,
+    "clip_range": 0.2, "n_epochs": 10, "batch_size": 64,
+    "n_steps": 2048, "ent_coef": 0.0001, "vf_coef": 0.5,
+    "max_grad_norm": 0.5,
 }
 
-# Network architecture  (§10.1)
-# Separate policy and value networks, 2×128 Tanh
 NET_ARCH = dict(pi=[128, 128], vf=[128, 128])
-ACTIVATION_FN = "Tanh"  # string key; resolved in train_ppo.py
-
-# Initial action std — controls exploration noise at training start.
-# With real attitude dynamics, high std (default 1.0) produces chaotic
-# trajectories that make returns unpredictable, preventing the value
-# function from learning.  0.6 (log_std_init=-0.5) gives enough
-# exploration to discover success while keeping trajectories smooth
-# enough for the value function to extract signal.
-LOG_STD_INIT = -0.5  # initial std ≈ 0.6; use in policy_kwargs
-LOG_STD_MIN = -1.5   # minimum std ≈ 0.30; prevents entropy collapse
-                      # that makes every SGD update exceed the KL threshold
+ACTIVATION_FN = "Tanh"
+LOG_STD_INIT = -0.5
+LOG_STD_MIN = -1.5
 
 # ============================================================
-# Camera  (§5)
+# Camera
 # ============================================================
 
-# Tello camera horizontal FOV (used for spawn validation)
-CAMERA_HFOV_RAD = math.radians(66)  # ~±33° from center
-CAMERA_VFOV_RAD = math.radians(49)  # approximate vertical FOV at 960×720
-
-# Sim camera resolution (from model.sdf)
+CAMERA_HFOV_RAD = math.radians(66)
+CAMERA_VFOV_RAD = math.radians(49)
 SIM_CAMERA_WIDTH = 960
 SIM_CAMERA_HEIGHT = 720
-SIM_CAMERA_HFOV_RAD = 1.43117  # 82° horizontal FOV from SDF
-
-# Derived camera intrinsics for solvePnP (computed from SDF parameters)
+SIM_CAMERA_HFOV_RAD = 1.43117
 SIM_CAMERA_FX = SIM_CAMERA_WIDTH / (2.0 * math.tan(SIM_CAMERA_HFOV_RAD / 2.0))
-SIM_CAMERA_FY = SIM_CAMERA_FX  # square pixels
+SIM_CAMERA_FY = SIM_CAMERA_FX
 SIM_CAMERA_CX = SIM_CAMERA_WIDTH / 2.0
 SIM_CAMERA_CY = SIM_CAMERA_HEIGHT / 2.0
 
-# ArUco marker (§3.1)
-MARKER_SIZE = 0.20   # m; physical side length (20 cm)
-MARKER_ID = 0        # ArUco dictionary ID to track
-MARKER_DICTIONARY = "DICT_4X4_50"  # must match the generated aruco_marker.png
-
 # ============================================================
-# Gazebo / Sim Interface
+# Gazebo / Sim
 # ============================================================
 
 GZ_WORLD_NAME = "tello_sim"
 GZ_DRONE_MODEL_NAME = "tello"
-CONTROL_RATE_HZ = 10  # agent decision rate  (§7.2)
+CONTROL_RATE_HZ = 10
 
 # ============================================================
-# Domain Randomization — future  (§11)
-# Placeholders so DR modules can import without guessing.
+# Domain Randomization — future
 # ============================================================
 
-# Wind  (§11.3)
-WIND_DRIFT_RANGE = 0.03       # N per axis, uniform ±
-WIND_IMPULSE_STD = 0.02       # N per axis per step
-
-# Odometry noise  (§11.4)
-ODOM_GAUSSIAN_STD = 0.1       # m/s per axis
-ODOM_BIAS_WALK_STD = 0.005    # m/s per step increment
-ODOM_FREEZE_PROB = 0.005      # per step (if not already frozen)
-ODOM_FREEZE_DURATION = (1, 5) # steps (min, max)
-
-# Battery sag  (§11.7)
-BATTERY_EFFICACY_RANGE = (0.70, 1.10)  # thrust multiplier per episode
-
-# Vision noise  (§11.2)
-VISION_POS_NOISE_BASE = 0.01    # m, additive
-VISION_POS_NOISE_SCALE = 0.015  # fraction of range (1.5%)
-VISION_YAW_NOISE_STD = 0.03     # rad (~1.7°)
-VISION_DROPOUT_DURATION = (1, 3)  # consecutive frames
-
-# Observation delay queue  (§11.8)
-OBS_DELAY_MIN = 2   # steps
-OBS_DELAY_MAX = 4   # steps
-
-# ToF noise  (§11.6)
-TOF_NOISE_STD_NORMAL = 0.015    # m
-TOF_NOISE_STD_CLOSE = 0.025     # m, below 0.05 m altitude
-
-# Furniture  (§11.9)
-FURNITURE_HEIGHT_RANGE = (0.30, None)  # max computed as PAD_ELEVATION - 0.10
-FURNITURE_WIDTH_RANGE = (0.5, 1.2)     # m
-FURNITURE_DEPTH_RANGE = (0.4, 0.8)     # m
-FURNITURE_Y_RANGE = (-2.0, 2.0)        # m from centerline
+WIND_DRIFT_RANGE = 0.03
+WIND_IMPULSE_STD = 0.02
+ODOM_GAUSSIAN_STD = 0.1
+ODOM_BIAS_WALK_STD = 0.005
+ODOM_FREEZE_PROB = 0.005
+ODOM_FREEZE_DURATION = (1, 5)
+BATTERY_EFFICACY_RANGE = (0.70, 1.10)
+VISION_POS_NOISE_BASE = 0.01
+VISION_POS_NOISE_SCALE = 0.015
+VISION_YAW_NOISE_STD = 0.03
+VISION_DROPOUT_DURATION = (1, 3)
+OBS_DELAY_MIN = 2
+OBS_DELAY_MAX = 4
+TOF_NOISE_STD_NORMAL = 0.015
+TOF_NOISE_STD_CLOSE = 0.025
+FURNITURE_HEIGHT_RANGE = (0.30, None)
+FURNITURE_WIDTH_RANGE = (0.5, 1.2)
+FURNITURE_DEPTH_RANGE = (0.4, 0.8)
+FURNITURE_Y_RANGE = (-2.0, 2.0)
