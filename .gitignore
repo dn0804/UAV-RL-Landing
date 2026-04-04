@@ -24,7 +24,7 @@ events.out.tfevents.*
 
 # IDE
 .vscode/
-.devcontainer/
+#.devcontainer/
 
 rl_uav_package.egg-info/
 
