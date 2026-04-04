@@ -57,6 +57,13 @@ OBS_SCALE = np.array([
 OBS_CLIP = 1.5
 DROPOUT_TIMER_CAP = 30
 
+# ── Hover checkpoint dropout tolerance ───────────────────────
+# Number of consecutive dropout frames tolerated during hover
+# dwell accumulation.  0 = original strict behavior.  A small
+# value (1-2) absorbs ArUco flicker without crediting dwell
+# against a fully stale position estimate.
+HOVER_DROPOUT_TOLERANCE = 2
+
 # ============================================================
 # Action Space
 # ============================================================
@@ -86,7 +93,7 @@ W_VEL_XY_UNI = 0.10
 MAX_VEL_XY = 0.5
 
 W_JERK = 0.004
-W_TIME = 0.02
+W_TIME = 0.01
 
 # ── Pre-checkpoint hover bonus ───────────────────────────────
 
@@ -109,8 +116,8 @@ DESCENT_COMMIT_Z_MARGIN = 0.10
 # When the marker is lost before checkpoint, penalize XYZ action
 # commands to teach the drone to stop and search with yaw only.
 # Grace period of 3 steps (0.3s) to ignore detection flicker.
-W_DROPOUT_FREEZE = 0.5       # per unit of |action_xyz| per step
-DROPOUT_GRACE_STEPS = 6    # steps before freeze penalty activates
+W_DROPOUT_FREEZE = 0.1       # per unit of |action_xyz| per step
+DROPOUT_GRACE_STEPS = 15    # steps before freeze penalty activates
 
 # ── Terminal rewards ─────────────────────────────────────────
 
@@ -128,12 +135,12 @@ R_TIMEOUT = -22.0
 # ============================================================
 
 # Cone geometry
-CONE_TIP_X = MARKER_WORLD_POS[0] - 0.50   # -0.90
+CONE_TIP_X = MARKER_WORLD_POS[0] - 1   # -0.90
 CONE_TIP_Y = MARKER_WORLD_POS[1]          #  0.00
 CONE_TIP_Z = MARKER_CENTER_Z              #  1.10
-CONE_HALF_ANGLE_RAD = math.radians(60)    # 120° full opening
+CONE_HALF_ANGLE_RAD = math.radians(70)    # 120° full opening
 CONE_COS_HALF_ANGLE = math.cos(CONE_HALF_ANGLE_RAD)  # 0.5
-CONE_LENGTH = 6.0                          # m from tip along +X axis
+CONE_LENGTH = 7.0                          # m from tip along +X axis
 
 # Flat floor and ceiling
 Z_FLOOR = 0.20       # m — drone must stay above this
@@ -177,7 +184,8 @@ CURRICULUM_STAGES = {
         "angle_max": math.radians(15),
         "hover_d_pad_max": 0.30, "hover_vxy_max": 0.5, "hover_dwell_steps": 5,
         "success_vz_max": 1.2, "success_vxy_max": 0.8, "success_d_xy_max": 0.25,
-        "max_steps": 150,
+        "max_steps": 1000,
+        "promotion_threshold": 0.90,
     },
     1: {
         "name": "close_moderate",
@@ -185,7 +193,8 @@ CURRICULUM_STAGES = {
         "angle_max": math.radians(15),
         "hover_d_pad_max": 0.25, "hover_vxy_max": 0.4, "hover_dwell_steps": 8,
         "success_vz_max": 0.9, "success_vxy_max": 0.6, "success_d_xy_max": 0.22,
-        "max_steps": 150,
+        "max_steps": 750,
+        "promotion_threshold": 0.90,
     },
     2: {
         "name": "close_firm",
@@ -193,7 +202,8 @@ CURRICULUM_STAGES = {
         "angle_max": math.radians(20),
         "hover_d_pad_max": 0.20, "hover_vxy_max": 0.35, "hover_dwell_steps": 10,
         "success_vz_max": 0.7, "success_vxy_max": 0.45, "success_d_xy_max": 0.20,
-        "max_steps": 150,
+        "max_steps": 500,
+        "promotion_threshold": 0.90,
     },
     3: {
         "name": "close_precise",
@@ -201,7 +211,8 @@ CURRICULUM_STAGES = {
         "angle_max": math.radians(25),
         "hover_d_pad_max": 0.18, "hover_vxy_max": 0.30, "hover_dwell_steps": 10,
         "success_vz_max": 0.5, "success_vxy_max": 0.35, "success_d_xy_max": 0.18,
-        "max_steps": 150,
+        "max_steps": 300,
+        "promotion_threshold": 0.85,
     },
     4: {
         "name": "medium_moderate",
@@ -209,7 +220,8 @@ CURRICULUM_STAGES = {
         "angle_max": math.radians(30),
         "hover_d_pad_max": 0.20, "hover_vxy_max": 0.35, "hover_dwell_steps": 10,
         "success_vz_max": 0.6, "success_vxy_max": 0.40, "success_d_xy_max": 0.18,
-        "max_steps": 200,
+        "max_steps": 400,
+        "promotion_threshold": 0.85,
     },
     5: {
         "name": "medium_precise",
@@ -217,7 +229,8 @@ CURRICULUM_STAGES = {
         "angle_max": math.radians(40),
         "hover_d_pad_max": 0.18, "hover_vxy_max": 0.30, "hover_dwell_steps": 10,
         "success_vz_max": 0.45, "success_vxy_max": 0.30, "success_d_xy_max": 0.15,
-        "max_steps": 200,
+        "max_steps": 400,
+        "promotion_threshold": 0.85,
     },
     6: {
         "name": "far_moderate",
@@ -225,21 +238,33 @@ CURRICULUM_STAGES = {
         "angle_max": math.radians(45),
         "hover_d_pad_max": 0.20, "hover_vxy_max": 0.35, "hover_dwell_steps": 10,
         "success_vz_max": 0.5, "success_vxy_max": 0.35, "success_d_xy_max": 0.18,
-        "max_steps": 300,
+        "max_steps": 400,
+        "promotion_threshold": 0.80,
     },
     7: {
+        "name": "far_wide",
+        "d_min": 0.5, "d_max": 4.0,
+        "angle_max": math.radians(60),
+        "hover_d_pad_max": 0.20, "hover_vxy_max": 0.35, "hover_dwell_steps": 10,
+        "success_vz_max": 0.5, "success_vxy_max": 0.35, "success_d_xy_max": 0.18,
+        "max_steps": 400,
+        "promotion_threshold": 0.80,
+    },
+    8: {
         "name": "far_precise",
         "d_min": 0.5, "d_max": 4.0,
         "angle_max": math.radians(60),
         "hover_d_pad_max": 0.15, "hover_vxy_max": 0.25, "hover_dwell_steps": 10,
-        "success_vz_max": 0.4, "success_vxy_max": 0.25, "success_d_xy_max": 0.12,
-        "max_steps": 300,
+        "success_vz_max": 0.3, "success_vxy_max": 0.20, "success_d_xy_max": 0.18,
+        "max_steps": 500,
+        "promotion_threshold": 0.80,  # final stage — no promotion, but kept for consistency
     },
 }
 
-CURRICULUM_PROMOTION_THRESHOLD = 0.75
+# Default fallback if a stage lacks "promotion_threshold" key
+CURRICULUM_PROMOTION_THRESHOLD = 0.80
 CURRICULUM_WINDOW_SIZE = 300
-CURRICULUM_BLEND_EPISODES = 1000
+CURRICULUM_BLEND_EPISODES = 300
 CURRICULUM_BLEND_STEPS = 5
 
 # ============================================================
@@ -264,8 +289,8 @@ LOG_STD_MIN = -1.5
 
 CAMERA_HFOV_RAD = math.radians(66)
 CAMERA_VFOV_RAD = math.radians(49)
-SIM_CAMERA_WIDTH = 960
-SIM_CAMERA_HEIGHT = 720
+SIM_CAMERA_WIDTH =  480 #1280
+SIM_CAMERA_HEIGHT = 360 #720
 SIM_CAMERA_HFOV_RAD = 1.43117
 SIM_CAMERA_FX = SIM_CAMERA_WIDTH / (2.0 * math.tan(SIM_CAMERA_HFOV_RAD / 2.0))
 SIM_CAMERA_FY = SIM_CAMERA_FX

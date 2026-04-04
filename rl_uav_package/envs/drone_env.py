@@ -31,6 +31,7 @@ from rl_uav_package.config.constants import (
     DESK_X_MIN, DESK_X_MAX, DESK_Y_MIN, DESK_Y_MAX,
     DESCENT_GATE_D_PAD, DESCENT_COMMIT_Z_MARGIN,
     HOVER_Z_MIN_CLEARANCE, HOVER_DWELL_STEPS,
+    HOVER_DROPOUT_TOLERANCE,
     R_HOVER_CHECKPOINT,
     DROPOUT_GRACE_STEPS,
     SUCCESS_VZ_MAX, SUCCESS_VXY_MAX, SUCCESS_D_XY_MAX,
@@ -292,7 +293,7 @@ class DroneEnv(gym.Env):
             derived["d_pad"] < hover_d_pad_max
             and state["z"] > PAD_ELEVATION + HOVER_Z_MIN_CLEARANCE
             and v_xy < hover_vxy_max
-            and self._dropout.timer == 0
+            and self._dropout.timer <= HOVER_DROPOUT_TOLERANCE
         )
         if hover_ok:
             self._hover_dwell_count += 1

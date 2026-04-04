@@ -33,6 +33,19 @@ RUN apt-get update && apt-get install -y \
     python3-pybind11 pybind11-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# ── MPI (for parallel training) ─────────────────────────────
+RUN apt-get update && apt-get install -y \
+    openmpi-bin libopenmpi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# MPI container fixes — shared-memory transport only
+ENV OMPI_MCA_btl=self,vader
+ENV OMPI_MCA_btl_vader_single_copy_mechanism=none
+ENV OMPI_ALLOW_RUN_AS_ROOT=1
+ENV OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+# Prevent HWLOC from scanning X11/GL (hangs in devcontainers)
+ENV HWLOC_COMPONENTS=-gl
+
 # ── Python environment ───────────────────────────────────────
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
@@ -40,6 +53,7 @@ COPY requirements.txt /tmp/requirements.txt
 RUN uv venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 RUN uv pip install -r /tmp/requirements.txt
+RUN uv pip install mpi4py
 
 # ── GPU / display ────────────────────────────────────────────
 ENV NVIDIA_VISIBLE_DEVICES=all
@@ -51,5 +65,7 @@ RUN { \
       echo 'alias train="bash /workspaces/UAV-RL-Landing/scripts/run.sh"'; \
       echo "alias unfollow=\"gz service -s /gui/follow --reqtype gz.msgs.StringMsg --reptype gz.msgs.Boolean --timeout 2000 --req 'data: \\\"\\\"'\""; \
     } >> ~/.bash_aliases
+
+
 
 WORKDIR /workspace

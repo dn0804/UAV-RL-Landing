@@ -5,6 +5,7 @@ Tracks the checkpoint pipeline: approach → hover checkpoint → descend → la
 """
 
 from collections import deque
+import time
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 
@@ -58,6 +59,10 @@ class TrainingLogger(BaseCallback):
         self._ep_steps = 0
         self._episode_count = 0
         self._total_successes = 0
+        self._rollout_start_time = None
+        self._rollout_end_time = None
+        self._last_collect_time = None
+        self._last_train_time = None
 
     def _on_training_start(self):
         if self.logger is None:
@@ -71,6 +76,31 @@ class TrainingLogger(BaseCallback):
         }.items():
             if isinstance(val, (int, float)):
                 self.logger.record(key, val)
+
+    def _on_rollout_start(self):
+        now = time.time()
+        # If we have a previous rollout_end, the gap is the train time
+        if self._rollout_end_time is not None:
+            self._last_train_time = now - self._rollout_end_time
+        self._rollout_start_time = now
+
+    def _on_rollout_end(self):
+        now = time.time()
+        if self._rollout_start_time is not None:
+            self._last_collect_time = now - self._rollout_start_time
+        self._rollout_end_time = now
+
+        # Log timing metrics
+        if self.logger is not None:
+            if self._last_collect_time is not None:
+                n_steps = self.model.n_steps
+                collect_fps = int(n_steps / max(self._last_collect_time, 1e-6))
+                self.logger.record("time/collect_fps", collect_fps)
+                self.logger.record("time/collect_seconds",
+                                   round(self._last_collect_time, 2))
+            if self._last_train_time is not None:
+                self.logger.record("time/train_seconds",
+                                   round(self._last_train_time, 2))
 
     def _on_step(self):
         infos = self.locals.get("infos", [])

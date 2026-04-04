@@ -80,14 +80,18 @@ class CurriculumManager(BaseCallback):
                 or self._current_stage >= self._max_stage
                 or self._cooldown_remaining > 0):
             return
-        if self._logger.success_rate >= CURRICULUM_PROMOTION_THRESHOLD:
+        stage_cfg = CURRICULUM_STAGES.get(self._current_stage, {})
+        threshold = stage_cfg.get("promotion_threshold",
+                                  CURRICULUM_PROMOTION_THRESHOLD)
+        if self._logger.success_rate >= threshold:
             self._blending = True
             self._blend_step = 0
             self._blend_ep_counter = 0
             if self.verbose >= 1:
                 ns = self._current_stage + 1
                 print(f"\n[CURRICULUM] {self._current_stage} → {ns} started "
-                      f"(sr={self._logger.success_rate:.2%}, ep={self._ep_count})")
+                      f"(sr={self._logger.success_rate:.2%}, "
+                      f"threshold={threshold:.0%}, ep={self._ep_count})")
 
     def _advance_blend(self):
         self._blend_ep_counter += 1
