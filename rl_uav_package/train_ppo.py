@@ -32,10 +32,6 @@ class SafePPO(PPO):
     def train(self):
         saved = {k: v.clone() for k, v in self.policy.state_dict().items()}
         super().train()
-        if any(th.isnan(p).any() for p in self.policy.parameters()):
-            self.policy.load_state_dict(saved)
-            self._nan_revert_count += 1
-            print(f"[NaN WATCHDOG] Reverted (#{self._nan_revert_count})")
         with th.no_grad():
             self.policy.log_std.clamp_(min=self.log_std_min)
 

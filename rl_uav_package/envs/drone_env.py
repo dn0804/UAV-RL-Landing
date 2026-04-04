@@ -7,6 +7,8 @@ Central orchestrator with checkpoint pipeline:
     3. Post-checkpoint: z-alignment targets pad, descent gradient
     4. Phase C latch: heavy descent + XY hold
     5. Landing: success terminal reward
+
+Communicates directly with Gazebo via gz-transport (no ROS bridge).
 """
 
 import math
@@ -19,13 +21,7 @@ import cv2
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from geometry_msgs.msg import Twist
-from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Image as RosImage
-from std_msgs.msg import Empty, Bool
+import gz_transport_py as gz
 
 from rl_uav_package.config.constants import (
     OBS_DIM, ACTION_DIM, ACTION_LOW, ACTION_HIGH,
@@ -35,6 +31,7 @@ from rl_uav_package.config.constants import (
     DESK_X_MIN, DESK_X_MAX, DESK_Y_MIN, DESK_Y_MAX,
     DESCENT_GATE_D_PAD, DESCENT_COMMIT_Z_MARGIN,
     HOVER_Z_MIN_CLEARANCE, HOVER_DWELL_STEPS,
+    HOVER_DROPOUT_TOLERANCE,
     R_HOVER_CHECKPOINT,
     DROPOUT_GRACE_STEPS,
     SUCCESS_VZ_MAX, SUCCESS_VXY_MAX, SUCCESS_D_XY_MAX,
@@ -56,7 +53,9 @@ from rl_uav_package.vision.aruco_tracker import (
 class DroneEnv(gym.Env):
     metadata = {"render_modes": []}
 
-    def __init__(self, initial_stage: int = 0, seed: int = 0):
+    def __init__(self, initial_stage: int = 0, seed: int = 0,
+                 model_name: str = "tello",
+                 image_topic: str = "/camera/image_raw"):
         super().__init__()
 
         self.action_space = spaces.Box(
@@ -84,44 +83,36 @@ class DroneEnv(gym.Env):
         self._hover_checkpoint_reached = False
         self._hover_dwell_count = 0
         self._descent_committed = False
-        self._dropout_freeze_logged = False  # log once per dropout event
+        self._dropout_freeze_logged = False
 
-        # ROS 2
-        if not rclpy.ok():
-            rclpy.init()
+        # ── gz-transport ─────────────────────────────────────
+        self._model_name = model_name
+        self._gz = gz.GzNode()
 
-        self._node = rclpy.create_node("rl_drone_env")
+        # Topic names — parameterized for multi-drone
+        odom_topic = f"/model/{model_name}/odometry"
+        self._cmd_vel_topic = f"/model/{model_name}/cmd_vel"
+        self._enable_topic = f"/model/{model_name}/enable"
+        self._image_topic = image_topic
 
-        qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.VOLATILE,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
-
-        self._odom_sub = self._node.create_subscription(
-            Odometry, "/odom", self._odom_cb, qos)
-        self._cmd_pub = self._node.create_publisher(Twist, "/cmd_vel", 10)
-        self._takeoff_pub = self._node.create_publisher(Empty, "/takeoff", 10)
-        self._land_pub = self._node.create_publisher(Empty, "/land", 10)
-        self._enable_pub = self._node.create_publisher(Bool, "/enable", 10)
-
+        # Subscriptions
         self._latest_odom = None
         self._odom_event = threading.Event()
+        self._gz.subscribe_odom(odom_topic, self._odom_cb)
 
         self._latest_image = None
         self._image_event = threading.Event()
-        self._cam_sub = self._node.create_subscription(
-            RosImage, "/camera/image_raw", self._image_cb, qos)
+        self._gz.subscribe_image(self._image_topic, self._image_cb)
+
+        # Publishers
+        self._gz.advertise_twist(self._cmd_vel_topic)
+        self._gz.advertise_bool(self._enable_topic)
 
         self._intrinsics = CameraIntrinsics(
             fx=SIM_CAMERA_FX, fy=SIM_CAMERA_FY,
             cx=SIM_CAMERA_CX, cy=SIM_CAMERA_CY,
         )
         self._marker_prev_pos = None
-
-        self._spin_thread = threading.Thread(target=self._spin, daemon=True)
-        self._spin_thread.start()
 
         # Teleport helper
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -141,13 +132,11 @@ class DroneEnv(gym.Env):
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, bufsize=1)
         ready = self._teleport_proc.stdout.readline().strip()
-        self._node.get_logger().info(f"Teleport helper: {ready}")
+        print(f"[DroneEnv] Teleport helper: {ready}")
 
         # Warmup
-        self._node.get_logger().info("Running warmup teleports...")
-        enable_msg = Bool()
-        enable_msg.data = True
-        self._enable_pub.publish(enable_msg)
+        print("[DroneEnv] Running warmup teleports...")
+        self._gz.publish_bool(self._enable_topic, True)
         for _ in range(3):
             self._teleport(2.0, 0.0, 1.5, math.pi)
             for _ in range(20):
@@ -156,34 +145,51 @@ class DroneEnv(gym.Env):
                 self._odom_event.wait(timeout=0.05)
             time.sleep(0.3)
 
-        self._node.get_logger().info("DroneEnv initialized.")
+        print("[DroneEnv] Initialized.")
 
     @property
     def spawner(self) -> Spawner:
         return self._spawner
 
-    def _spin(self):
-        rclpy.spin(self._node)
+    # ── gz-transport callbacks ────────────────────────────────
 
-    def _odom_cb(self, msg):
-        self._latest_odom = msg
+    def _odom_cb(self, px, py, pz, qw, qx, qy, qz, vx, vy, vz):
+        """Called on gz-transport thread. Builds the same dict
+        _extract_state() returns so all downstream code works unchanged."""
+        sinr_cosp = 2.0 * (qw * qx + qy * qz)
+        cosr_cosp = 1.0 - 2.0 * (qx * qx + qy * qy)
+        roll = math.atan2(sinr_cosp, cosr_cosp)
+
+        sinp = 2.0 * (qw * qy - qz * qx)
+        pitch = math.copysign(math.pi / 2, sinp) if abs(sinp) >= 1 else math.asin(sinp)
+
+        siny_cosp = 2.0 * (qw * qz + qx * qy)
+        cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+
+        self._latest_odom = {
+            "x": px, "y": py, "z": pz,
+            "vx": vx, "vy": vy, "vz": vz,
+            "roll": roll, "pitch": pitch, "yaw": yaw,
+        }
         self._odom_event.set()
 
-    def _image_cb(self, msg):
-        self._latest_image = msg
+    def _image_cb(self, data, width, height):
+        """Called on gz-transport thread. Stores raw bytes + dims."""
+        self._latest_image = (data, width, height)
         self._image_event.set()
 
     # ── Vision pipeline ──────────────────────────────────────
 
     def _process_vision(self):
-        img_msg = self._latest_image
-        if img_msg is None:
+        img_data = self._latest_image
+        if img_data is None:
             self._dropout.on_miss()
             x, y, z, _, px, py = self._dropout.get_pose()
             return x, y, z, px, py
 
-        img = np.frombuffer(img_msg.data, dtype=np.uint8).reshape(
-            img_msg.height, img_msg.width, 3)
+        data, width, height = img_data
+        img = np.frombuffer(data, dtype=np.uint8).reshape(height, width, 3)
         gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
         result = detect_marker(
@@ -222,11 +228,11 @@ class DroneEnv(gym.Env):
         for _ in range(5):
             self._image_event.clear()
             self._image_event.wait(timeout=0.2)
-            img_msg = self._latest_image
-            if img_msg is None:
+            img_data = self._latest_image
+            if img_data is None:
                 continue
-            img = np.frombuffer(img_msg.data, dtype=np.uint8).reshape(
-                img_msg.height, img_msg.width, 3)
+            data, width, height = img_data
+            img = np.frombuffer(data, dtype=np.uint8).reshape(height, width, 3)
             gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
             result = detect_marker(
                 image=gray, marker_size=MARKER_SIZE,
@@ -287,7 +293,7 @@ class DroneEnv(gym.Env):
             derived["d_pad"] < hover_d_pad_max
             and state["z"] > PAD_ELEVATION + HOVER_Z_MIN_CLEARANCE
             and v_xy < hover_vxy_max
-            and self._dropout.timer == 0
+            and self._dropout.timer <= HOVER_DROPOUT_TOLERANCE
         )
         if hover_ok:
             self._hover_dwell_count += 1
@@ -314,12 +320,6 @@ class DroneEnv(gym.Env):
             and not self._hover_checkpoint_reached
             and not self._descent_committed
         )
-        # if dropout_freeze_active and not self._dropout_freeze_logged:
-        #     self._dropout_freeze_logged = True
-        #     self._node.get_logger().warn(
-        #         f"[DROPOUT FREEZE] Marker lost at step {self._step_count}, "
-        #         f"dropout_timer={self._dropout.timer}, "
-        #         f"pos=({state['x']:.2f}, {state['y']:.2f}, {state['z']:.2f})")
 
         # ── Termination ──────────────────────────────────────
         vz_thresh, vxy_thresh, d_xy_thresh = self._get_success_thresholds()
@@ -336,10 +336,9 @@ class DroneEnv(gym.Env):
             hover_checkpoint_reached=self._hover_checkpoint_reached)
 
         if self._step_count == 1 and terminated:
-            self._node.get_logger().warn(
-                f"  STEP-1 CRASH [{outcome}]: "
-                f"pos=({state['x']:.2f}, {state['y']:.2f}, {state['z']:.2f}) "
-                f"vel=({state['vx']:.2f}, {state['vy']:.2f}, {state['vz']:.2f})")
+            print(f"  [WARN] STEP-1 CRASH [{outcome}]: "
+                  f"pos=({state['x']:.2f}, {state['y']:.2f}, {state['z']:.2f}) "
+                  f"vel=({state['vx']:.2f}, {state['vy']:.2f}, {state['vz']:.2f})")
 
         # ── Vision ───────────────────────────────────────────
         vis_x, vis_y, vis_z, vis_px, vis_py = self._process_vision()
@@ -429,20 +428,16 @@ class DroneEnv(gym.Env):
             spawn = self._spawner.sample()
             self._publish_action(np.zeros(ACTION_DIM))
             self._teleport(spawn["x"], spawn["y"], spawn["z"], spawn["yaw"])
-            self._takeoff_pub.publish(Empty())
-            enable_msg = Bool()
-            enable_msg.data = True
-            self._enable_pub.publish(enable_msg)
+            self._gz.publish_bool(self._enable_topic, True)
             state = self._wait_for_stable_hover()
             detection = self._detect_first_frame()
             if detection is not None:
                 body_pos, initial_px, initial_py = detection
                 break
-            self._node.get_logger().warn(
-                f"First-frame validation failed (attempt {attempt + 1})")
+            print(f"[WARN] First-frame validation failed (attempt {attempt + 1})")
 
         if body_pos is None:
-            self._node.get_logger().error("Marker not detected; using odom fallback")
+            print("[ERROR] Marker not detected; using odom fallback")
             body_pos = np.array([
                 state["x"] - MARKER_WORLD_POS[0],
                 state["y"] - MARKER_WORLD_POS[1],
@@ -475,29 +470,19 @@ class DroneEnv(gym.Env):
         return obs, {}
 
     def close(self):
-        self._node.get_logger().info("Shutting down DroneEnv.")
+        print("[DroneEnv] Shutting down.")
         if self._teleport_proc and self._teleport_proc.poll() is None:
             self._teleport_proc.terminate()
             self._teleport_proc.wait(timeout=2.0)
-        self._node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
-        self._spin_thread.join(timeout=2.0)
+        self._gz.shutdown()
 
     # ── State extraction ─────────────────────────────────────
 
     def _extract_state(self):
-        odom = self._latest_odom
-        if odom is None:
+        if self._latest_odom is None:
             return {k: 0.0 for k in
                     ["x", "y", "z", "vx", "vy", "vz", "roll", "pitch", "yaw"]}
-        pos = odom.pose.pose.position
-        vel = odom.twist.twist.linear
-        q = odom.pose.pose.orientation
-        roll, pitch, yaw = quat_to_euler(q)
-        return {"x": pos.x, "y": pos.y, "z": pos.z,
-                "vx": vel.x, "vy": vel.y, "vz": vel.z,
-                "roll": roll, "pitch": pitch, "yaw": yaw}
+        return self._latest_odom
 
     def _compute_derived(self, state):
         return compute_derived(state)
@@ -541,7 +526,7 @@ class DroneEnv(gym.Env):
     def _teleport(self, x, y, z, yaw):
         w = math.cos(yaw / 2.0)
         qz = math.sin(yaw / 2.0)
-        cmd = f"{GZ_DRONE_MODEL_NAME} {x} {y} {z} {w} 0.0 0.0 {qz}\n"
+        cmd = f"{self._model_name} {x} {y} {z} {w} 0.0 0.0 {qz}\n"
         self._teleport_proc.stdin.write(cmd)
         self._teleport_proc.stdin.flush()
         self._teleport_proc.stdout.readline()
@@ -550,33 +535,33 @@ class DroneEnv(gym.Env):
             self._odom_event.wait(timeout=0.05)
 
     def _publish_action(self, action):
-        enable_msg = Bool()
-        enable_msg.data = True
-        self._enable_pub.publish(enable_msg)
+        self._gz.publish_bool(self._enable_topic, True)
         state = self._extract_state()
         yaw = state["yaw"]
         cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
         vx_body, vy_body = float(action[0]), float(action[1])
-        msg = Twist()
-        msg.linear.x = vx_body * cos_yaw - vy_body * sin_yaw
-        msg.linear.y = vx_body * sin_yaw + vy_body * cos_yaw
-        msg.linear.z = float(action[2])
-        msg.angular.z = float(action[3])
-        self._cmd_pub.publish(msg)
+        self._gz.publish_twist(
+            self._cmd_vel_topic,
+            lx=vx_body * cos_yaw - vy_body * sin_yaw,
+            ly=vx_body * sin_yaw + vy_body * cos_yaw,
+            lz=float(action[2]),
+            az=float(action[3]),
+        )
 
 
 # =====================================================================
 # Module-level pure functions
 # =====================================================================
 
-def quat_to_euler(q):
-    sinr_cosp = 2.0 * (q.w * q.x + q.y * q.z)
-    cosr_cosp = 1.0 - 2.0 * (q.x * q.x + q.y * q.y)
+def quat_to_euler(q_w, q_x, q_y, q_z):
+    """Quaternion to (roll, pitch, yaw). Kept for external use."""
+    sinr_cosp = 2.0 * (q_w * q_x + q_y * q_z)
+    cosr_cosp = 1.0 - 2.0 * (q_x * q_x + q_y * q_y)
     roll = math.atan2(sinr_cosp, cosr_cosp)
-    sinp = 2.0 * (q.w * q.y - q.z * q.x)
+    sinp = 2.0 * (q_w * q_y - q_z * q_x)
     pitch = math.copysign(math.pi / 2, sinp) if abs(sinp) >= 1 else math.asin(sinp)
-    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    siny_cosp = 2.0 * (q_w * q_z + q_x * q_y)
+    cosy_cosp = 1.0 - 2.0 * (q_y * q_y + q_z * q_z)
     yaw = math.atan2(siny_cosp, cosy_cosp)
     return roll, pitch, yaw
 

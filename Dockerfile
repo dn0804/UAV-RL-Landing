@@ -1,62 +1,71 @@
-# Use the official ROS 2 Humble desktop image
-FROM osrf/ros:humble-desktop
+# Base: Ubuntu 22.04 — no ROS dependency
+FROM ubuntu:22.04
 
-# Set non-interactive to avoid timezone prompts during apt installs
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Update and install basic utility tools
+# ── Core tools ───────────────────────────────────────────────
 RUN apt-get update && apt-get install -y \
-    curl \
-    wget \
-    git \
-    tmux \
-    nano \
-    python3-pip \
+    curl wget git tmux nano \
+    python3-pip python3-dev python3-venv \
+    cmake build-essential pkg-config \
+    lsb-release gnupg \
     && rm -rf /var/lib/apt/lists/*
 
-# Set up environment variables for GUI and Gazebo
-ENV DISPLAY=$DISPLAY
-ENV NVIDIA_VISIBLE_DEVICES=all
-ENV NVIDIA_DRIVER_CAPABILITIES=all
-ENV GZ_VERSION=garden
-
-# Source ROS 2 automatically in bash
-RUN echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc
-
-# Source ROS 2 automatically and inject custom aliases
-RUN echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc && \
-    { \
-      echo 'alias train="bash /workspaces/scripts/run.sh"'; \
-      echo "alias unfollow=\"gz service -s /gui/follow --reqtype gz.msgs.StringMsg --reptype gz.msgs.Boolean --timeout 2000 --req 'data: \\\"\\\"'\""; \
-    } >> ~/.bash_aliases
-
-# Install Gazebo Garden, Dev Headers, and the ROS 2 Bridge
-RUN wget https://packages.osrfoundation.org/gazebo.gpg -O /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg && \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/pkgs-osrf-archive-keyring.gpg] http://packages.osrfoundation.org/gazebo/ubuntu-stable jammy main" | tee /etc/apt/sources.list.d/gazebo-stable.list > /dev/null && \
+# ── Gazebo Garden + dev headers ──────────────────────────────
+RUN wget https://packages.osrfoundation.org/gazebo.gpg \
+        -O /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) \
+          signed-by=/usr/share/keyrings/pkgs-osrf-archive-keyring.gpg] \
+          http://packages.osrfoundation.org/gazebo/ubuntu-stable \
+          $(lsb_release -cs) main" \
+        > /etc/apt/sources.list.d/gazebo-stable.list && \
     apt-get update && apt-get install -y \
     gz-garden \
     libgz-sim7-dev \
     libgz-transport12-dev \
+    libgz-msgs9-dev \
     libgz-sensors7-dev \
     libgz-math7-dev \
-    ros-humble-ros-gzgarden \
-    ros-humble-rqt-image-view \
-    ros-humble-cv-bridge \
-    python3-colcon-common-extensions \
     && rm -rf /var/lib/apt/lists/*
 
-# 1. Pull the compiled uv binary directly from Astral's official image
+# ── pybind11 (for gz_transport_py build) ─────────────────────
+RUN apt-get update && apt-get install -y \
+    python3-pybind11 pybind11-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── MPI (for parallel training) ─────────────────────────────
+RUN apt-get update && apt-get install -y \
+    openmpi-bin libopenmpi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# MPI container fixes — shared-memory transport only
+ENV OMPI_MCA_btl=self,vader
+ENV OMPI_MCA_btl_vader_single_copy_mechanism=none
+ENV OMPI_ALLOW_RUN_AS_ROOT=1
+ENV OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+# Prevent HWLOC from scanning X11/GL (hangs in devcontainers)
+ENV HWLOC_COMPONENTS=-gl
+
+# ── Python environment ───────────────────────────────────────
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
-# 2. Copy your requirements file into the container
 COPY requirements.txt /tmp/requirements.txt
-
-# 3. Create a virtual environment that allows ROS 2 imports
-RUN uv venv /opt/venv --system-site-packages
-
-# 4. Make the virtual environment the default Python path for all future commands
+RUN uv venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
-
 RUN uv pip install -r /tmp/requirements.txt
+RUN uv pip install mpi4py
 
-WORKDIR /workspaces
+# ── GPU / display ────────────────────────────────────────────
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=all
+ENV GZ_VERSION=garden
+
+# ── Shell aliases ────────────────────────────────────────────
+RUN { \
+      echo 'alias train="bash /workspaces/UAV-RL-Landing/scripts/run.sh"'; \
+      echo "alias unfollow=\"gz service -s /gui/follow --reqtype gz.msgs.StringMsg --reptype gz.msgs.Boolean --timeout 2000 --req 'data: \\\"\\\"'\""; \
+    } >> ~/.bash_aliases
+
+
+
+WORKDIR /workspace

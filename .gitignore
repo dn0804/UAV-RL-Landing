@@ -1,27 +1,31 @@
-# ROS 2 build folders
-ros2_ws/build/
-ros2_ws/install/
-ros2_ws/log/
-ros2_ws/logs/
-
-# Python caches
+# Python
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
 
 # Virtual environments
 venv/
 .env/
 .venv/
 
-# Docker Local Overrides
+# Build artifacts
+gz_transport_py/build/
+*.so
+
+# Docker local overrides
 docker-compose.override.yml
 
-# Machine Learning Artifacts
-ros2_ws/models/
+# Training artifacts
+models/
+logs/
 *.zip
 events.out.tfevents.*
 
-# IDE and Editor Configurations
+# IDE
 .vscode/
 .devcontainer/
+
+rl_uav_package.egg-info/
+
+UAV-RL-Landing.code-workspace
